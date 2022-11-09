@@ -1,0 +1,53 @@
+syntax = "proto3";
+package buildbuildbuild;
+
+import "google/protobuf/timestamp.proto";
+import "build/bazel/remote/execution/v2/remote_execution.proto";
+
+option go_package = "github.com/ricochet1k/buildbuildbuild/clusterpb";
+
+enum NodeType {
+	SERVER = 0;
+	WORKER = 1;
+}
+
+message NodeMetadata {
+	NodeType type = 1;
+}
+
+message NodeMessage {
+	string from = 1;
+
+	NodeState state = 2;
+	optional StartJob start_job = 4;
+
+	string subscribe = 5;
+	string unsubscribe = 6;
+	string publish = 7;
+	Message publish_msg = 8;
+}
+
+message NodeState {
+	int32 jobs_queued = 1;
+	int32 jobs_running = 2;
+	int32 jobs_slots_free = 3;
+}
+
+// this is essentially a copy of ExecuteRequest
+message StartJob {
+	string id = 1;
+	string instance_name = 2;
+	build.bazel.remote.execution.v2.Digest action_digest = 3;
+	bool skip_cache_lookup = 4;
+}
+
+// messages sent through PubSub
+message Message {
+	oneof type {
+		JobStatus job_status = 1;
+	}
+}
+
+message JobStatus {
+	build.bazel.remote.execution.v2.ExecutionStage.Value stage = 1;
+}
