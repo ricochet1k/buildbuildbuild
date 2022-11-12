@@ -8,6 +8,7 @@ require (
 	github.com/golang/protobuf v1.5.2
 	github.com/google/uuid v1.3.0
 	github.com/hashicorp/serf v0.10.1
+	github.com/sirupsen/logrus v1.9.0
 	golang.org/x/sync v0.1.0
 	google.golang.org/genproto v0.0.0-20221107162902-2d387536bcdd
 	google.golang.org/grpc v1.50.1

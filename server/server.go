@@ -21,18 +21,24 @@ import (
 )
 
 type Server struct {
-	bucket        string
-	uploader      *s3manager.Uploader
-	downloader    *s3manager.Downloader
-	uploads       *sync.Map
-	nodeType      clusterpb.NodeType
-	metadata      []byte
-	list          *serf.Serf
-	nodeState     map[string]*clusterpb.NodeState
-	pubsub        PubSub
-	jobSlots      chan struct{} // semaphore channel pattern
-	jobQueueMutex sync.Mutex
-	jobQueue      []func(string) // node name
+	clusterpb.UnimplementedWorkerServer
+	config                  *Config
+	bucket                  string
+	sess                    *session.Session
+	uploader                *s3manager.Uploader
+	downloader              *s3manager.Downloader
+	downloaderNoConcurrency *s3manager.Downloader
+	uploads                 sync.Map
+	nodeType                clusterpb.NodeType
+	metadata                []byte
+	list                    *serf.Serf
+	nodeState               map[string]*clusterpb.NodeState
+	pubsub                  PubSub
+	jobSlots                chan struct{} // semaphore channel pattern
+	jobsRunning             sync.Map
+	jobQueueMutex           sync.Mutex
+	jobQueue                []func(string) // node name
+	grpcClients             map[string]*grpc.ClientConn
 }
 
 type uploadStatus struct {
@@ -40,32 +46,41 @@ type uploadStatus struct {
 	complete       bool
 }
 
-func NewServer(bucket string, sess *session.Session, nodeType clusterpb.NodeType) (*Server, error) {
+func NewServer(config *Config, sess *session.Session) (*Server, error) {
 	uploader := s3manager.NewUploader(sess)
 	downloader := s3manager.NewDownloader(sess)
+	downloaderNoConcurrency := s3manager.NewDownloader(sess, func(d *s3manager.Downloader) { d.Concurrency = 1 })
 
 	// list objects as a quick test to make sure S3 works
 	_, err := downloader.S3.ListObjects(&s3.ListObjectsInput{
-		Bucket:  &bucket,
+		Bucket:  &config.Bucket,
 		MaxKeys: aws.Int64(1),
 	})
 	if err != nil {
 		return nil, err
 	}
 
+	nodeType := clusterpb.NodeType_SERVER
+	if config.Worker {
+		nodeType = clusterpb.NodeType_WORKER
+	}
+
 	c := &Server{
-		bucket:     bucket,
-		uploader:   uploader,
-		downloader: downloader,
-		uploads:    &sync.Map{},
-		nodeType:   nodeType,
-		nodeState:  map[string]*clusterpb.NodeState{},
+		config:                  config,
+		bucket:                  config.Bucket,
+		sess:                    sess,
+		uploader:                uploader,
+		downloader:              downloader,
+		downloaderNoConcurrency: downloaderNoConcurrency,
+		nodeType:                nodeType,
+		nodeState:               map[string]*clusterpb.NodeState{},
 		pubsub: PubSub{
 			subscribers: map[string][]Subscriber{},
 		},
+		grpcClients: map[string]*grpc.ClientConn{},
 	}
 
-	if nodeType == clusterpb.NodeType_WORKER {
+	if config.Worker {
 		c.InitWorker()
 	}
 
@@ -83,6 +98,10 @@ func (c *Server) Register(grpcServer *grpc.Server) {
 	buildeventpb.RegisterPublishBuildEventServer(grpcServer, c)
 	bytestreampb.RegisterByteStreamServer(grpcServer, c)
 	longrunningpb.RegisterOperationsServer(grpcServer, c)
+
+	if c.nodeType == clusterpb.NodeType_WORKER {
+		clusterpb.RegisterWorkerServer(grpcServer, c)
+	}
 }
 
 const (

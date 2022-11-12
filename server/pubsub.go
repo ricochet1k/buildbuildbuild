@@ -75,8 +75,8 @@ func (c *Server) RemoteUnsubscribe(node, key string) {
 // Because of the lock in Publish, all handlers must use goroutines if they want to publish or subscribe
 func (c *Server) Publish(key string, msg *clusterpb.Message) bool {
 	c.pubsub.Lock()
+	defer c.pubsub.Unlock()
 	subscribers := c.pubsub.subscribers[key]
-	c.pubsub.Unlock()
 
 	subscribersStillAlive := subscribers[:0]
 	for _, subscriber := range subscribers {

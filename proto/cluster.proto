@@ -2,6 +2,7 @@ syntax = "proto3";
 package buildbuildbuild;
 
 import "google/protobuf/timestamp.proto";
+import "google/rpc/status.proto";
 import "build/bazel/remote/execution/v2/remote_execution.proto";
 
 option go_package = "github.com/ricochet1k/buildbuildbuild/clusterpb";
@@ -15,16 +16,16 @@ message NodeMetadata {
 	NodeType type = 1;
 }
 
+// messages sent through UserEvent
 message NodeMessage {
 	string from = 1;
 
 	NodeState state = 2;
-	optional StartJob start_job = 4;
 
-	string subscribe = 5;
-	string unsubscribe = 6;
-	string publish = 7;
-	Message publish_msg = 8;
+	string subscribe = 3;
+	string unsubscribe = 4;
+	string publish = 5;
+	Message publish_msg = 6;
 }
 
 message NodeState {
@@ -33,13 +34,7 @@ message NodeState {
 	int32 jobs_slots_free = 3;
 }
 
-// this is essentially a copy of ExecuteRequest
-message StartJob {
-	string id = 1;
-	string instance_name = 2;
-	build.bazel.remote.execution.v2.Digest action_digest = 3;
-	bool skip_cache_lookup = 4;
-}
+message StartJobReply {}
 
 // messages sent through PubSub
 message Message {
@@ -48,6 +43,33 @@ message Message {
 	}
 }
 
+// messages sent through Query
+message Query {
+	// oneof type {
+	// }
+}
+
 message JobStatus {
 	build.bazel.remote.execution.v2.ExecutionStage.Value stage = 1;
+	build.bazel.remote.execution.v2.ExecuteResponse response = 2;
+	google.rpc.Status error = 3;
+	build.bazel.remote.execution.v2.Digest action_digest = 4;
+}
+
+service Worker {
+	rpc StartJob (StartJobRequest) returns (stream JobStatus) {}
+	rpc FollowJob (FollowJobRequest) returns (stream JobStatus) {}
+}
+
+// this is essentially a copy of ExecuteRequest
+message StartJobRequest {
+	string id = 1;
+	string instance_name = 2;
+	build.bazel.remote.execution.v2.Digest action_digest = 3;
+	bool skip_cache_lookup = 4;
+	google.protobuf.Timestamp queued_timestamp = 5;
+}
+
+message FollowJobRequest {
+	string id = 1;
 }

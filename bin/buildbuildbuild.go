@@ -1,16 +1,20 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"os"
+	"os/signal"
+	"sync"
+	"syscall"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/ricochet1k/buildbuildbuild/server"
-	"github.com/ricochet1k/buildbuildbuild/server/clusterpb"
+	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 )
 
@@ -27,11 +31,28 @@ var region = flag.String("region", "us-east-1", "AWS region")
 var worker = flag.Bool("worker", false, "Run worker node")
 
 func main() {
+	log.SetOutput(logrus.New().Writer())
 	flag.Parse()
+
+	config := &server.Config{
+		Listen:      *listen,
+		Port:        *port,
+		ClusterName: *clusterName,
+		ClusterHost: *clusterHost,
+		ClusterPort: *clusterPort,
+		Join:        *join,
+		Bucket:      *bucket,
+		Region:      *region,
+		Worker:      *worker,
+	}
+
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	address := fmt.Sprintf("%v:%v", *listen, *port)
 	lis, err := net.Listen("tcp", address)
 	if err != nil {
-		log.Fatalf("failed to listen: %v", err)
+		logrus.Fatalf("failed to listen: %v", err)
 	}
 	var opts []grpc.ServerOption
 	grpcServer := grpc.NewServer(opts...)
@@ -40,19 +61,40 @@ func main() {
 		Region: aws.String(*region),
 	}))
 
-	nodeType := clusterpb.NodeType_SERVER
-	if *worker {
-		nodeType = clusterpb.NodeType_WORKER
-	}
-
-	c, err := server.NewServer(*bucket, sess, nodeType)
+	c, err := server.NewServer(config, sess)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Unable to list objects in bucket %q: %v\n", *bucket, err)
-		os.Exit(10)
+		logrus.Fatalf("Unable to list objects in bucket %q: %v\n", *bucket, err)
 	}
 	c.Register(grpcServer)
-	c.InitCluster(*clusterName, *clusterHost, *clusterPort, *join)
+	c.InitCluster()
 
-	fmt.Printf("Listening for GRPC on %s\n", address)
-	grpcServer.Serve(lis)
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		s := <-sigCh
+		logrus.Printf("got signal %v, attempting graceful shutdown", s)
+		cancel()
+		wg.Add(1)
+		go func() {
+			c.GracefulStop()
+			wg.Done()
+		}()
+		wg.Add(1)
+		go func() {
+			grpcServer.GracefulStop()
+			wg.Done()
+		}()
+		wg.Done()
+	}()
+
+	logrus.Printf("Listening for GRPC on %s\n", address)
+	err = grpcServer.Serve(lis)
+	if err != nil {
+		logrus.Fatalf("could not serve: %v", err)
+	}
+
+	wg.Wait()
+	logrus.Println("Graceful shutdown")
 }

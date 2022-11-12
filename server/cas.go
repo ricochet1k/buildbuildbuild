@@ -3,7 +3,6 @@ package server
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -15,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	execpb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	"github.com/golang/protobuf/proto"
+	"github.com/sirupsen/logrus"
 )
 
 // Determine if blobs are present in the CAS.
@@ -30,39 +30,38 @@ import (
 func (c *Server) FindMissingBlobs(ctx context.Context, req *execpb.FindMissingBlobsRequest) (*execpb.FindMissingBlobsResponse, error) {
 	eg, ctx := errgroup.WithContext(ctx)
 
-	allMissing := make(chan []*execpb.Digest, 1)
+	// logrus.Printf("FindMissingBlobs: %v", req)
+
 	missing := make(chan *execpb.Digest)
 	go func() {
-		missingDigests := []*execpb.Digest{}
-		for digest := range missing {
-			missingDigests = append(missingDigests, digest)
+		for _, digest := range req.BlobDigests {
+			digest := digest // no closure capture bugs
+			key := StorageKey(req.InstanceName, CONTENT_CAS, DigestKey(digest))
+			eg.Go(func() error {
+				_, err := c.downloader.S3.HeadObjectWithContext(ctx, &s3.HeadObjectInput{
+					Bucket: &c.bucket,
+					Key:    &key,
+				})
+				if err != nil {
+					missing <- digest
+				}
+				return nil
+			})
 		}
-		allMissing <- missingDigests
-		close(allMissing)
+
+		if err := eg.Wait(); err != nil {
+			logrus.Printf("FindMissingBlobs Err %v\n", err)
+		}
+
+		close(missing)
 	}()
 
-	for _, digest := range req.BlobDigests {
-		digest := digest // no closure capture bugs
-		key := StorageKey(req.InstanceName, CONTENT_CAS, DigestKey(digest))
-		eg.Go(func() error {
-			_, err := c.downloader.S3.HeadObjectWithContext(ctx, &s3.HeadObjectInput{
-				Bucket: &c.bucket,
-				Key:    &key,
-			})
-			if err != nil {
-				missing <- digest
-			}
-			return nil
-		})
+	missingDigests := []*execpb.Digest{}
+	for digest := range missing {
+		missingDigests = append(missingDigests, digest)
 	}
 
-	if err := eg.Wait(); err != nil {
-		fmt.Printf("FindMissingBlobs Err %v\n", err)
-		return nil, err
-	}
-
-	close(missing)
-	missingDigests := <-allMissing
+	logrus.Printf("FindMissingBlobs missing: %v", missingDigests)
 
 	return &execpb.FindMissingBlobsResponse{
 		MissingBlobDigests: missingDigests,
@@ -84,8 +83,8 @@ func (c *Server) FindMissingBlobs(ctx context.Context, req *execpb.FindMissingBl
 //
 // Errors:
 //
-// * `INVALID_ARGUMENT`: The client attempted to upload more than the
-//   server supported limit.
+//   - `INVALID_ARGUMENT`: The client attempted to upload more than the
+//     server supported limit.
 //
 // Individual requests may return the following errors, additionally:
 //
@@ -112,7 +111,7 @@ func (c *Server) BatchUpdateBlobs(ctx context.Context, reqs *execpb.BatchUpdateB
 				Metadata: metadata,
 			})
 			if err != nil {
-				fmt.Printf("Upload Error: %v\n", err)
+				logrus.Printf("Upload Error: %v\n", err)
 			}
 
 			s, _ := status.FromError(err)
@@ -208,6 +207,6 @@ func (c *Server) BatchReadBlobs(ctx context.Context, reqs *execpb.BatchReadBlobs
 // * `NOT_FOUND`: The requested tree root is not present in the CAS.
 
 func (c *Server) GetTree(req *execpb.GetTreeRequest, gts execpb.ContentAddressableStorage_GetTreeServer) error {
-	fmt.Println("Unimplemented: GetTree")
+	logrus.Println("Unimplemented: GetTree")
 	return status.Error(codes.Unimplemented, "GetTree not implemented")
 }

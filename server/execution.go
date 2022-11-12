@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hashicorp/serf/serf"
+	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -14,6 +16,7 @@ import (
 	longrunningpb "google.golang.org/genproto/googleapis/longrunning"
 	"google.golang.org/protobuf/types/known/anypb"
 	emptypb "google.golang.org/protobuf/types/known/emptypb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 func (c *Server) QueueJob(f func(string)) {
@@ -30,6 +33,37 @@ func (c *Server) RequestJob(node string) {
 		c.jobQueue = c.jobQueue[:len(c.jobQueue)-1]
 		job(node)
 	}
+}
+
+func jobStatusToOperation(jobId string, msg *clusterpb.JobStatus) *longrunningpb.Operation {
+	logrus.Printf("job status! %v\n", msg)
+
+	metadata, _ := anypb.New(&execpb.ExecuteOperationMetadata{
+		Stage:        msg.Stage,
+		ActionDigest: msg.ActionDigest,
+		// StdoutStreamName: "",
+		// StderrStreamName: "",
+	})
+
+	op := &longrunningpb.Operation{
+		Name:     jobId,
+		Metadata: metadata,
+	}
+
+	if msg.Error != nil {
+		op.Result = &longrunningpb.Operation_Error{
+			Error: msg.Error,
+		}
+		op.Done = true
+	} else if msg.Response != nil {
+		response, _ := anypb.New(msg.Response)
+		op.Result = &longrunningpb.Operation_Response{
+			Response: response,
+		}
+		op.Done = true
+	}
+
+	return op
 }
 
 // Execute an action remotely.
@@ -74,21 +108,21 @@ func (c *Server) RequestJob(node string) {
 // server MUST NOT set the `error` field of the `Operation` proto.
 // The possible errors include:
 //
-// * `INVALID_ARGUMENT`: One or more arguments are invalid.
-// * `FAILED_PRECONDITION`: One or more errors occurred in setting up the
-//   action requested, such as a missing input or command or no worker being
-//   available. The client may be able to fix the errors and retry.
-// * `RESOURCE_EXHAUSTED`: There is insufficient quota of some resource to run
-//   the action.
-// * `UNAVAILABLE`: Due to a transient condition, such as all workers being
-//   occupied (and the server does not support a queue), the action could not
-//   be started. The client should retry.
-// * `INTERNAL`: An internal error occurred in the execution engine or the
-//   worker.
-// * `DEADLINE_EXCEEDED`: The execution timed out.
-// * `CANCELLED`: The operation was cancelled by the client. This status is
-//   only possible if the server implements the Operations API CancelOperation
-//   method, and it was called for the current execution.
+//   - `INVALID_ARGUMENT`: One or more arguments are invalid.
+//   - `FAILED_PRECONDITION`: One or more errors occurred in setting up the
+//     action requested, such as a missing input or command or no worker being
+//     available. The client may be able to fix the errors and retry.
+//   - `RESOURCE_EXHAUSTED`: There is insufficient quota of some resource to run
+//     the action.
+//   - `UNAVAILABLE`: Due to a transient condition, such as all workers being
+//     occupied (and the server does not support a queue), the action could not
+//     be started. The client should retry.
+//   - `INTERNAL`: An internal error occurred in the execution engine or the
+//     worker.
+//   - `DEADLINE_EXCEEDED`: The execution timed out.
+//   - `CANCELLED`: The operation was cancelled by the client. This status is
+//     only possible if the server implements the Operations API CancelOperation
+//     method, and it was called for the current execution.
 //
 // In the case of a missing input or command, the server SHOULD additionally
 // send a [PreconditionFailure][google.rpc.PreconditionFailure] error detail
@@ -101,79 +135,93 @@ func (c *Server) RequestJob(node string) {
 // multiple times, potentially in parallel. These redundant executions MAY
 // continue to run, even if the operation is completed.
 func (c *Server) Execute(req *execpb.ExecuteRequest, es execpb.Execution_ExecuteServer) error {
-	job := &clusterpb.StartJob{
+	job := &clusterpb.StartJobRequest{
 		Id:              uuid.New().String(),
 		InstanceName:    req.InstanceName,
 		ActionDigest:    req.ActionDigest,
 		SkipCacheLookup: req.SkipCacheLookup,
+		QueuedTimestamp: timestamppb.Now(),
 	}
-	running := false
 	completed := make(chan struct{})
 
-	var startJob func(node string)
-	startJob = func(node string) {
-		if running {
-			return
-		}
-		fmt.Printf("Sending job to %v: %v\n", node, job.Id)
-		c.SendNodeMessage(node, &clusterpb.NodeMessage{StartJob: job})
-		time.Sleep(3 * time.Second)
-		if !running {
-			fmt.Printf("Queueing job: %v\n", job.Id)
-			c.QueueJob(startJob)
+	handleJobStatus := func(status *clusterpb.JobStatus) {
+		op := jobStatusToOperation(job.Id, status)
+
+		err := es.Send(op)
+		if err != nil {
+			logrus.Printf("Error sending longrunning.Operation: %v", err)
 		}
 	}
 
-	c.SubscribeFn("jobstatus:"+job.Id, func(c *Server, key string, msg *clusterpb.Message) bool {
-		fmt.Printf("job status! %v\n", msg)
-		running = true
+	startJob := func(node string) error {
+		logrus.Printf("Sending job to %v: %v\n", node, job.Id)
 
-		metadata, _ := anypb.New(&execpb.ExecuteOperationMetadata{
-			Stage:        msg.GetJobStatus().Stage,
-			ActionDigest: req.ActionDigest,
-			// StdoutStreamName: "",
-			// StderrStreamName: "",
-		})
+		conn, err := c.ConnectToMember(node)
+		if err == nil {
+			worker := clusterpb.NewWorkerClient(conn)
+			stream, err := worker.StartJob(es.Context(), job)
+			if err != nil {
+				logrus.Printf("Error starting job %v: %v\n", node, job.Id)
+				return err
+			}
 
-		es.Send(&longrunningpb.Operation{
-			Name:     job.Id,
-			Metadata: metadata,
-		})
-		if msg.GetJobStatus().Stage == execpb.ExecutionStage_COMPLETED {
-			close(completed)
-			return false // stop listening
+			// read first message to see if it actually started
+			status, err := stream.Recv()
+			if err != nil {
+				logrus.Printf("Received initial err from JobStatus: %v", err)
+				return err
+			}
+
+			go func() {
+				for {
+					handleJobStatus(status)
+
+					status, err = stream.Recv()
+					if err != nil {
+						logrus.Printf("Received err from JobStatus: %v", err)
+						break
+					}
+
+				}
+				close(completed)
+			}()
+			return nil
 		}
-		return true // keep listening
-	})
+		return fmt.Errorf("Could send job to %v: %w\n", node, err)
+	}
+
+	var startJobQueued func(node string)
+	startJobQueued = func(node string) {
+		err := startJob(node)
+		if err == nil {
+			return
+		}
+
+		logrus.Printf("Queueing job: %v\n", job.Id)
+		c.QueueJob(startJobQueued)
+	}
 
 	started := false
 	for node, state := range c.nodeState {
 		if state.JobsSlotsFree > 0 {
-			startJob(node)
-			started = true
-			break
+			err := startJob(node)
+			if err == nil {
+				started = true
+				break
+			}
 		}
 	}
 	if !started {
-		fmt.Printf("Queueing job: %v\n", job.Id)
-		c.QueueJob(startJob)
+		logrus.Printf("Queueing job: %v\n", job.Id)
+		handleJobStatus(&clusterpb.JobStatus{
+			Stage: execpb.ExecutionStage_QUEUED,
+		})
+		c.QueueJob(startJobQueued)
 	}
-
-	metadata, _ := anypb.New(&execpb.ExecuteOperationMetadata{
-		Stage:        execpb.ExecutionStage_QUEUED,
-		ActionDigest: req.ActionDigest,
-		// StdoutStreamName: "",
-		// StderrStreamName: "",
-	})
-
-	es.Send(&longrunningpb.Operation{
-		Name:     job.Id,
-		Metadata: metadata,
-	})
 
 	<-completed
 
-	return status.Error(codes.Unimplemented, "Execute not implemented")
+	return nil // status.Error(codes.Unimplemented, "Execute not implemented")
 }
 
 // Wait for an execution operation to complete. When the client initially
@@ -183,8 +231,67 @@ func (c *Server) Execute(req *execpb.ExecuteRequest, es execpb.Execution_Execute
 // server MAY choose to stream additional updates as execution progresses,
 // such as to provide an update as to the state of the execution.
 func (c *Server) WaitExecution(req *execpb.WaitExecutionRequest, wes execpb.Execution_WaitExecutionServer) error {
-	fmt.Println("Unimplemented: Execute")
-	return status.Error(codes.Unimplemented, "WaitExecution not implemented")
+	// Find where job is running with a Query
+	query, err := c.list.Query("wherejob", []byte(req.Name), &serf.QueryParam{
+		FilterNodes: nil,
+		FilterTags:  map[string]string{"worker": "true"},
+		RequestAck:  true,
+		RelayFactor: 1,
+		Timeout:     time.Second,
+	})
+	if err != nil {
+		logrus.Printf("Query error: %v", err)
+		return err
+	}
+
+	if acks := query.AckCh(); acks != nil {
+		go func() {
+			for ack := range acks {
+				logrus.Printf("ACK from: %v", ack)
+			}
+		}()
+	}
+	var node string
+	for response := range query.ResponseCh() {
+		logrus.Printf("Response: %v", response)
+		node = string(response.From)
+	}
+
+	// Connect and FollowJob
+	if node == "" {
+		return status.Error(codes.NotFound, "Job not found")
+	}
+
+	conn, err := c.ConnectToMember(node)
+	if err != nil {
+		return status.Errorf(codes.NotFound, "Unable to connect to worker: %v", err)
+	}
+
+	worker := clusterpb.NewWorkerClient(conn)
+	stream, err := worker.FollowJob(wes.Context(), &clusterpb.FollowJobRequest{Id: req.Name})
+	if err != nil {
+		return status.Errorf(codes.NotFound, "Unable to follow job: %v", err)
+	}
+
+	for {
+		status, err := stream.Recv()
+		if err != nil {
+			logrus.Printf("Received err from JobStatus: %v", err)
+			break
+		}
+
+		logrus.Printf("job status! %v\n", status)
+
+		op := jobStatusToOperation(req.Name, status)
+
+		err = wes.Send(op)
+		if err != nil {
+			logrus.Printf("Error sending longrunning.Operation: %v", err)
+			break
+		}
+	}
+
+	return nil
 }
 
 // CancelOperation implements longrunningpb.OperationsServer
