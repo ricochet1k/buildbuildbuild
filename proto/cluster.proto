@@ -7,15 +7,6 @@ import "build/bazel/remote/execution/v2/remote_execution.proto";
 
 option go_package = "github.com/ricochet1k/buildbuildbuild/clusterpb";
 
-enum NodeType {
-	SERVER = 0;
-	WORKER = 1;
-}
-
-message NodeMetadata {
-	NodeType type = 1;
-}
-
 // messages sent through UserEvent
 message NodeMessage {
 	string from = 1;

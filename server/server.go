@@ -29,12 +29,13 @@ type Server struct {
 	downloader              *s3manager.Downloader
 	downloaderNoConcurrency *s3manager.Downloader
 	uploads                 sync.Map
-	nodeType                clusterpb.NodeType
 	metadata                []byte
 	list                    *serf.Serf
 	nodeState               map[string]*clusterpb.NodeState
 	pubsub                  PubSub
+	downloadConcurrency     chan struct{} // semaphore channel pattern
 	jobSlots                chan struct{} // semaphore channel pattern
+	downloading             sync.Map
 	jobsRunning             sync.Map
 	jobQueueMutex           sync.Mutex
 	jobQueue                []func(string) // node name
@@ -60,11 +61,6 @@ func NewServer(config *Config, sess *session.Session) (*Server, error) {
 		return nil, err
 	}
 
-	nodeType := clusterpb.NodeType_SERVER
-	if config.Worker {
-		nodeType = clusterpb.NodeType_WORKER
-	}
-
 	c := &Server{
 		config:                  config,
 		bucket:                  config.Bucket,
@@ -72,7 +68,7 @@ func NewServer(config *Config, sess *session.Session) (*Server, error) {
 		uploader:                uploader,
 		downloader:              downloader,
 		downloaderNoConcurrency: downloaderNoConcurrency,
-		nodeType:                nodeType,
+		downloadConcurrency:     make(chan struct{}, config.DownloadConcurrency),
 		nodeState:               map[string]*clusterpb.NodeState{},
 		pubsub: PubSub{
 			subscribers: map[string][]Subscriber{},
@@ -80,7 +76,7 @@ func NewServer(config *Config, sess *session.Session) (*Server, error) {
 		grpcClients: map[string]*grpc.ClientConn{},
 	}
 
-	if config.Worker {
+	if config.WorkerSlots > 0 {
 		c.InitWorker()
 	}
 
@@ -99,7 +95,7 @@ func (c *Server) Register(grpcServer *grpc.Server) {
 	bytestreampb.RegisterByteStreamServer(grpcServer, c)
 	longrunningpb.RegisterOperationsServer(grpcServer, c)
 
-	if c.nodeType == clusterpb.NodeType_WORKER {
+	if c.config.WorkerSlots > 0 {
 		clusterpb.RegisterWorkerServer(grpcServer, c)
 	}
 }

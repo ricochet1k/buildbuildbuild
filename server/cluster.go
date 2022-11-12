@@ -38,7 +38,7 @@ func (c *Server) InitCluster() {
 	serfConfig.Logger = logger
 	serfConfig.MemberlistConfig.Logger = logger
 
-	if c.config.Worker {
+	if c.config.WorkerSlots > 0 {
 		serfConfig.Tags["worker"] = "true"
 	}
 

@@ -1,26 +1,18 @@
 package server
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/base64"
 	"fmt"
-	"io"
-	"io/fs"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	execpb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	"github.com/golang/protobuf/proto"
-	wrapperspb "github.com/golang/protobuf/ptypes/wrappers"
 	"github.com/ricochet1k/buildbuildbuild/server/clusterpb"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
@@ -30,7 +22,7 @@ import (
 )
 
 func (c *Server) InitWorker() {
-	c.jobSlots = make(chan struct{}, 4)
+	c.jobSlots = make(chan struct{}, c.config.WorkerSlots)
 	go func() {
 		for {
 			time.Sleep(5 * time.Second)
@@ -38,6 +30,14 @@ func (c *Server) InitWorker() {
 				JobsRunning:   int32(len(c.jobSlots)),
 				JobsSlotsFree: int32(cap(c.jobSlots)) - int32(len(c.jobSlots)),
 			})
+		}
+	}()
+
+	// periodically clean the cache to keep the disk from filling up
+	go func() {
+		for {
+			time.Sleep(5 * time.Minute)
+			c.CleanOldCacheFiles()
 		}
 	}()
 }
@@ -99,6 +99,7 @@ type RunningJob struct {
 	InstanceName    string
 	ExecRoot        string
 	ActionDigest    *execpb.Digest
+	inputBytes      int64
 	downloadedBytes int64
 	c               *Server
 	eg              *errgroup.Group
@@ -146,10 +147,20 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 		return err
 	}
 
+	defer func() {
+		// TODO: debug flag to keep execroot
+		go func() {
+			if err := os.RemoveAll(execroot); err != nil {
+				logrus.Warnf("Unable to remove execroot %q: %v", execroot, err)
+			}
+		}()
+	}()
+
 	fmt.Printf("Worker starting job: %v  in %q  %v\n", req.Id, execroot, req.ActionDigest)
 	defer fmt.Printf("Worker job complete: %v\n", req.Id)
 
 	eg, egctx := errgroup.WithContext(ctx)
+	// eg.SetLimit(c.config.DownloadConcurrency)
 	job := &RunningJob{
 		Id:           req.Id,
 		InstanceName: req.InstanceName,
@@ -183,9 +194,9 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 		logrus.Printf("Action platform: %v", action.Platform)
 	}
 
-	start := time.Now()
+	// start := time.Now()
 	metadata.InputFetchStartTimestamp = timestamppb.Now()
-	eg.Go(func() error { return c.DownloadAll(egctx, job, "", action.InputRootDigest) })
+	eg.Go(func() error { return job.DownloadAll(egctx, "", action.InputRootDigest) })
 
 	var command execpb.Command
 	if err := c.DownloadProto(ctx, StorageKey(req.InstanceName, CONTENT_CAS, DigestKey(action.CommandDigest)), &command); err != nil {
@@ -198,7 +209,25 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 		return err
 	}
 
+	// waitingForDownload := make(chan struct{})
+	// go func() {
+	// 	done := false
+	// 	for !done {
+	// 		select {
+	// 		case <-time.NewTimer(5 * time.Second).C:
+	// 		case <-waitingForDownload:
+	// 			done = true
+	// 		}
+
+	// 		downloadDuration := time.Since(start)
+	// 		mbs := float64(atomic.LoadInt64(&job.downloadedBytes)) / 1000000.0
+	// 		mbstotal := float64(atomic.LoadInt64(&job.inputBytes)) / 1000000.0
+	// 		logrus.Printf("Downloading %.1f/%.1f MB for %.1f... (maybe waiting for others)", mbs, mbstotal, downloadDuration)
+	// 	}
+	// }()
+
 	err = job.eg.Wait()
+	// close(waitingForDownload)
 	metadata.InputFetchCompletedTimestamp = timestamppb.Now()
 	if err != nil {
 		logrus.Printf("Worker cannot get inputRoot: %v", err)
@@ -209,9 +238,6 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 		})
 		return err
 	}
-	downloadDuration := time.Since(start)
-	mbs := float64(atomic.LoadInt64(&job.downloadedBytes)) / 1000000.0
-	logrus.Printf("Downloaded %.1f MB in %v (%.1f MB/s)", mbs, downloadDuration, mbs/downloadDuration.Seconds())
 
 	// make sure all output path dirs exist
 	if len(command.OutputPaths) > 0 {
@@ -299,7 +325,7 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 	metadata.OutputUploadStartTimestamp = timestamppb.Now()
 	if len(command.OutputPaths) > 0 {
 		for _, path := range command.OutputPaths {
-			if _, err := c.UploadOutputPath(ctx, job, actionResult, path); err != nil {
+			if _, err := job.UploadOutputPath(ctx, actionResult, path); err != nil {
 				logrus.Error(err)
 				job.UpdateJobStatus(&clusterpb.JobStatus{
 					Stage: execpb.ExecutionStage_COMPLETED,
@@ -311,7 +337,7 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 	} else {
 		// OutputFiles/Directories instead, supposedly "deprecated" but still used by Bazel
 		for _, path := range command.OutputFiles {
-			isdir, err := c.UploadOutputPath(ctx, job, actionResult, path)
+			isdir, err := job.UploadOutputPath(ctx, actionResult, path)
 			if err != nil {
 				logrus.Error(err)
 				job.UpdateJobStatus(&clusterpb.JobStatus{
@@ -331,7 +357,7 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 		}
 
 		for _, path := range command.OutputDirectories {
-			isdir, err := c.UploadOutputPath(ctx, job, actionResult, path)
+			isdir, err := job.UploadOutputPath(ctx, actionResult, path)
 			if err != nil {
 				logrus.Error(err)
 				job.UpdateJobStatus(&clusterpb.JobStatus{
@@ -373,377 +399,5 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 		},
 	})
 
-	// TODO: debug flag to keep execroot
-	go func() {
-		err := os.RemoveAll(execroot)
-		if err != nil {
-			logrus.Warnf("Unable to remove execroot %q: %v", execroot, err)
-		}
-	}()
-
 	return nil
-}
-
-func (c *Server) DownloadAll(ctx context.Context, job *RunningJob, path string, dirDigest *execpb.Digest) error {
-	var dir execpb.Directory
-	if err := c.DownloadProto(ctx, StorageKey(job.InstanceName, CONTENT_CAS, DigestKey(dirDigest)), &dir); err != nil {
-		logrus.Printf("Worker cannot get dir: %v", err)
-
-		return err
-	}
-
-	mode := uint32(0755)
-	if dir.NodeProperties != nil && dir.NodeProperties.UnixMode != nil {
-		mode = dir.NodeProperties.UnixMode.Value
-	}
-	if err := os.Mkdir(filepath.Join(job.ExecRoot, path), os.FileMode(mode)); err != nil && !os.IsExist(err) {
-		return fmt.Errorf("Mkdir %q: %w", path, err)
-	}
-	// logrus.Printf("Mkdir %q: %q", path, filepath.Join(job.ExecRoot, path))
-
-	if err := c.ApplyNodeProperties(ctx, job, path, dir.NodeProperties); err != nil {
-		return err
-	}
-
-	for _, subdir := range dir.Directories {
-		subdir := subdir
-		job.eg.Go(func() error {
-			return c.DownloadAll(ctx, job, filepath.Join(path, subdir.Name), subdir.Digest)
-		})
-	}
-
-	for _, file := range dir.Files {
-		file := file
-		job.eg.Go(func() error {
-			return c.DownloadFile(ctx, job, filepath.Join(path, file.Name), file)
-		})
-	}
-
-	for _, symlink := range dir.Symlinks {
-		sympath := filepath.Join(path, symlink.Name)
-		if err := os.Symlink(filepath.Join(job.ExecRoot, symlink.Target), filepath.Join(job.ExecRoot, sympath)); err != nil {
-			return fmt.Errorf("Symlink %q: %w", sympath, err)
-		}
-
-		if err := c.ApplyNodeProperties(ctx, job, sympath, symlink.NodeProperties); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (c *Server) ApplyNodeProperties(ctx context.Context, job *RunningJob, path string, props *execpb.NodeProperties) error {
-	// mode is set during creation
-	if props == nil {
-		return nil
-	}
-
-	if props.Mtime != nil {
-		if err := os.Chtimes(filepath.Join(job.ExecRoot, path), props.Mtime.AsTime(), props.Mtime.AsTime()); err != nil {
-			return fmt.Errorf("Chtimes %q: %w", path, err)
-		}
-	}
-
-	return nil
-}
-
-func statToNodeProperties(stat fs.FileInfo) *execpb.NodeProperties {
-	return &execpb.NodeProperties{
-		Properties: nil,
-		Mtime:      timestamppb.New(stat.ModTime()),
-		UnixMode:   &wrapperspb.UInt32Value{Value: uint32(stat.Mode())},
-	}
-}
-
-func (c *Server) DownloadFile(ctx context.Context, job *RunningJob, path string, fileNode *execpb.FileNode) error {
-	// logrus.Printf("DownloadFile %v", path)
-	// start := time.Now()
-	mode := uint32(0644)
-	if fileNode.NodeProperties != nil && fileNode.NodeProperties.UnixMode != nil {
-		mode = fileNode.NodeProperties.UnixMode.Value
-	}
-	if fileNode.IsExecutable {
-		mode |= 0111
-	}
-	f, err := os.OpenFile(filepath.Join(job.ExecRoot, path), os.O_RDWR|os.O_CREATE|os.O_TRUNC, os.FileMode(mode))
-	if err != nil {
-		return fmt.Errorf("OpenFile failed %q: %w", path, err)
-	}
-	defer f.Close()
-
-	if fileNode.Digest.SizeBytes > 0 {
-		key := StorageKey(job.InstanceName, CONTENT_CAS, DigestKey(fileNode.Digest))
-
-		downloader := s3manager.NewDownloader(c.sess, func(d *s3manager.Downloader) { d.PartSize = 20 * 1000 * 1000 })
-		n, err := downloader.DownloadWithContext(ctx, f, &s3.GetObjectInput{
-			Bucket: &c.bucket,
-			Key:    aws.String(key),
-		})
-		if err != nil {
-			return fmt.Errorf("Download %q: %w", key, err)
-		}
-		atomic.AddInt64(&job.downloadedBytes, n)
-	}
-
-	if err := c.ApplyNodeProperties(ctx, job, path, fileNode.NodeProperties); err != nil {
-		return err
-	}
-
-	// dur := time.Since(start)
-	// log.Printf("DownloadFile %v (%v) took %v", path, fileNode.Digest.SizeBytes, dur)
-
-	return nil
-}
-
-// returns true if path refers to a directory (possibly through a symlink)
-func (c *Server) UploadOutputPath(ctx context.Context, job *RunningJob, actionResult *execpb.ActionResult, path string) (bool, error) {
-	stat, err := os.Lstat(filepath.Join(job.ExecRoot, path))
-	if err != nil {
-		return false, fmt.Errorf("Output missing %q: %v", path, err)
-	}
-
-	props := statToNodeProperties(stat)
-
-	if stat.Mode()&os.ModeSymlink != 0 {
-		target, err := os.Readlink(filepath.Join(job.ExecRoot, path))
-		if err != nil {
-			return false, fmt.Errorf("Output missing %q: %v", target, err)
-		}
-
-		isdir, err := c.UploadOutputPath(ctx, job, actionResult, target)
-		if err != nil {
-			return false, err
-		}
-
-		if isdir {
-			outlink := &execpb.OutputSymlink{
-				Path:           path,
-				Target:         target,
-				NodeProperties: props,
-			}
-			actionResult.OutputDirectorySymlinks = append(actionResult.OutputDirectorySymlinks, outlink)
-		} else {
-			outlink := &execpb.OutputSymlink{
-				Path:           path,
-				Target:         target,
-				NodeProperties: props,
-			}
-			actionResult.OutputFileSymlinks = append(actionResult.OutputFileSymlinks, outlink)
-		}
-
-		return isdir, nil
-	} else if stat.IsDir() {
-		outdir := &execpb.OutputDirectory{
-			Path: path,
-			// TreeDigest:            &execpb.Digest{},
-			IsTopologicallySorted: true,
-		}
-		actionResult.OutputDirectories = append(actionResult.OutputDirectories, outdir)
-		job.eg.Go(func() error {
-			digest, err := c.UploadTree(ctx, job, path)
-			outdir.TreeDigest = digest
-			return err
-		})
-
-		return true, nil
-	} else {
-		outfile := &execpb.OutputFile{
-			Path: path,
-			// Digest:         &execpb.Digest{},
-			// IsExecutable:   false,
-			// Contents:       []byte{},
-			NodeProperties: props,
-		}
-		actionResult.OutputFiles = append(actionResult.OutputFiles, outfile)
-		job.eg.Go(func() error {
-			digest, stat, err := c.UploadFile(ctx, job, path)
-			if err != nil {
-				return err
-			}
-			outfile.Digest = digest
-			outfile.IsExecutable = stat.Mode()&os.FileMode(0100) != 0
-			return nil
-		})
-
-		return false, nil
-	}
-}
-
-func (c *Server) UploadTree(ctx context.Context, job *RunningJob, path string) (*execpb.Digest, error) {
-	// We are manually generating this proto in topologically sorted order, partly to avoid the overhead
-	// of proto.Marshal multiple times per directory. See execpb.OutputDirectory.IsTopologicallySorted for more detail.
-	var alldirs []*execpb.Directory
-	var allbytes []*[]byte
-	_, err := c.UploadDirectory(ctx, job, &alldirs, &allbytes, path)
-	if err != nil {
-		return nil, err
-	}
-
-	totalBytesLen := 0
-	for _, bs := range allbytes {
-		totalBytesLen += len(*bs)
-	}
-
-	// var tree execpb.Tree
-	// tree.Root = alldirs[0]
-	// tree.Children = alldirs[1:]
-	var buf bytes.Buffer
-	buf.Grow(totalBytesLen)
-	buf.WriteByte((1 << 3) | 2) // field 1, wiretype LEN
-	buf.Write(*allbytes[0])
-	for _, bs := range allbytes[1:] {
-		buf.WriteByte((2 << 3) | 2) // field 2, wiretype LEN
-		buf.Write(*bs)
-	}
-
-	treebytes := buf.Bytes()
-
-	h := sha256.New()
-	if _, err := io.Copy(h, bytes.NewReader(treebytes)); err != nil {
-		return nil, err
-	}
-
-	hash := fmt.Sprintf("%x", h.Sum(nil))
-	digest := &execpb.Digest{
-		Hash:      hash,
-		SizeBytes: int64(len(treebytes)),
-	}
-
-	job.eg.Go(func() error {
-		_, err := c.uploader.UploadWithContext(ctx, &s3manager.UploadInput{
-			Body:           &buf,
-			Bucket:         &c.bucket,
-			ChecksumSHA256: &hash,
-			Key:            aws.String(StorageKey(job.InstanceName, CONTENT_CAS, DigestKey(digest))),
-			Metadata: map[string]*string{
-				"B-Type": aws.String("Tree"),
-				"B-Path": &path,
-			},
-		})
-		return err
-	})
-
-	return digest, nil
-}
-
-func (c *Server) UploadDirectory(ctx context.Context, job *RunningJob, alldirs *[]*execpb.Directory, allbytes *[]*[]byte, path string) (*execpb.Digest, error) {
-	var dir execpb.Directory
-	dirbytes := new([]byte)
-	*alldirs = append(*alldirs, &dir)
-	*allbytes = append(*allbytes, dirbytes)
-
-	entries, err := os.ReadDir(filepath.Join(job.ExecRoot, path))
-	if err != nil {
-		return nil, err
-	}
-
-	eg, ctx := errgroup.WithContext(ctx)
-
-	for _, entry := range entries {
-		if entry.IsDir() {
-			dirnode := &execpb.DirectoryNode{
-				Name: entry.Name(),
-				// Digest: digest,
-			}
-			dir.Directories = append(dir.Directories, dirnode)
-			eg.Go(func() error {
-				digest, err := c.UploadDirectory(ctx, job, alldirs, allbytes, filepath.Join(path, entry.Name()))
-				if err != nil {
-					return err
-				}
-				dirnode.Digest = digest
-				return nil
-			})
-		} else {
-			filenode := &execpb.FileNode{
-				Name: entry.Name(),
-				// Digest:         digest,
-				// IsExecutable:   stat,
-				// NodeProperties: &execpb.NodeProperties{},
-			}
-			dir.Files = append(dir.Files, filenode)
-			eg.Go(func() error {
-				digest, stat, err := c.UploadFile(ctx, job, filepath.Join(path, entry.Name()))
-				if err != nil {
-					return err
-				}
-				filenode.Digest = digest
-				filenode.IsExecutable = stat.Mode()&fs.FileMode(0100) != 0
-				filenode.NodeProperties = statToNodeProperties(stat)
-				return nil
-			})
-		}
-	}
-
-	if err = eg.Wait(); err != nil {
-		return nil, err
-	}
-
-	*dirbytes, err = proto.Marshal(&dir)
-	if err != nil {
-		return nil, err
-	}
-
-	h := sha256.New()
-	if _, err := io.Copy(h, bytes.NewReader(*dirbytes)); err != nil {
-		return nil, err
-	}
-
-	hash := fmt.Sprintf("%x", h.Sum(nil))
-	digest := &execpb.Digest{
-		Hash:      hash,
-		SizeBytes: int64(len(*dirbytes)),
-	}
-
-	return digest, nil
-}
-
-func (c *Server) UploadFile(ctx context.Context, job *RunningJob, path string) (*execpb.Digest, fs.FileInfo, error) {
-	log.Printf("UploadFile %v", path)
-	f, err := os.Open(filepath.Join(job.ExecRoot, path))
-	if err != nil {
-		return nil, nil, err
-	}
-
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		f.Close()
-		return nil, nil, err
-	}
-
-	stat, err := f.Stat()
-	if err != nil {
-		return nil, nil, err
-	}
-
-	rawhash := h.Sum(nil)
-	hash := fmt.Sprintf("%x", rawhash)
-	digest := &execpb.Digest{
-		Hash:      hash,
-		SizeBytes: stat.Size(),
-	}
-	hashb64 := base64.StdEncoding.EncodeToString(rawhash)
-
-	_, err = f.Seek(0, 0)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	job.eg.Go(func() error {
-		defer f.Close()
-		_, err := c.uploader.UploadWithContext(ctx, &s3manager.UploadInput{
-			Body:           f,
-			Bucket:         &c.bucket,
-			ChecksumSHA256: &hashb64,
-			Key:            aws.String(StorageKey(job.InstanceName, CONTENT_CAS, DigestKey(digest))),
-			Metadata: map[string]*string{
-				"B-Type": aws.String("File"),
-				"B-Path": &path,
-			},
-		})
-		return err
-	})
-
-	return digest, stat, nil
 }

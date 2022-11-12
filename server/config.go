@@ -9,7 +9,9 @@ type Config struct {
 	ClusterPort int
 	Join        string
 
-	Bucket string
-	Region string
-	Worker bool
+	Bucket              string
+	Region              string
+	WorkerSlots         int
+	DownloadConcurrency int
+	CacheDir            string
 }

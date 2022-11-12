@@ -29,19 +29,8 @@ import (
 func (c *Server) GetActionResult(ctx context.Context, req *execpb.GetActionResultRequest) (*execpb.ActionResult, error) {
 	key := StorageKey(req.InstanceName, CONTENT_ACTION, DigestKey(req.ActionDigest))
 
-	buf := aws.NewWriteAtBuffer(make([]byte, 0, 10*1024))
-
-	_, err := c.downloader.DownloadWithContext(ctx, buf, &s3.GetObjectInput{
-		Bucket: &c.bucket,
-		Key:    aws.String(key),
-	})
-	if err != nil {
-		// fmt.Printf("ActionResult Failed to download %q: %v\n", key, err)
-		return nil, status.Error(codes.NotFound, err.Error())
-	}
-
 	var ar execpb.ActionResult
-	err = proto.Unmarshal(buf.Bytes(), &ar)
+	err := c.DownloadProto(ctx, key, &ar)
 	if err != nil {
 		fmt.Printf("GetActionResult Err %q %v\n", key, err)
 		c.downloader.S3.DeleteObjectWithContext(ctx, &s3.DeleteObjectInput{
@@ -51,9 +40,22 @@ func (c *Server) GetActionResult(ctx context.Context, req *execpb.GetActionResul
 		return nil, err
 	}
 
-	// TODO: check CAS to make sure blobs are still available
-
-	// fmt.Printf("ActionResult YAY! %q\n", key)
+	// check CAS to make sure blobs are still available
+	blobs := []*execpb.Digest{}
+	for _, file := range ar.OutputFiles {
+		blobs = append(blobs, file.Digest)
+	}
+	for _, dir := range ar.OutputDirectories {
+		blobs = append(blobs, dir.TreeDigest)
+	}
+	missing, err := c.FindMissingBlobs(ctx, &execpb.FindMissingBlobsRequest{
+		InstanceName: req.InstanceName,
+		BlobDigests:  blobs,
+	})
+	if err != nil || len(missing.MissingBlobDigests) > 0 {
+		// couldn't find some blobs, return NotFound so bazel will re-run and re-upload
+		return nil, status.Error(codes.NotFound, err.Error())
+	}
 
 	return &ar, nil
 }
@@ -72,11 +74,11 @@ func (c *Server) GetActionResult(ctx context.Context, req *execpb.GetActionResul
 //
 // Errors:
 //
-// * `INVALID_ARGUMENT`: One or more arguments are invalid.
-// * `FAILED_PRECONDITION`: One or more errors occurred in updating the
-//   action result, such as a missing command or action.
-// * `RESOURCE_EXHAUSTED`: There is insufficient storage space to add the
-//   entry to the cache.
+//   - `INVALID_ARGUMENT`: One or more arguments are invalid.
+//   - `FAILED_PRECONDITION`: One or more errors occurred in updating the
+//     action result, such as a missing command or action.
+//   - `RESOURCE_EXHAUSTED`: There is insufficient storage space to add the
+//     entry to the cache.
 func (c *Server) UpdateActionResult(ctx context.Context, req *execpb.UpdateActionResultRequest) (*execpb.ActionResult, error) {
 	key := StorageKey(req.InstanceName, CONTENT_ACTION, DigestKey(req.ActionDigest))
 

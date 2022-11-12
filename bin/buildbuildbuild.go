@@ -4,10 +4,12 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log"
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 
@@ -28,22 +30,35 @@ var join = flag.String("join", "", "join cluster ip")
 
 var bucket = flag.String("bucket", "", "S3 bucket")
 var region = flag.String("region", "us-east-1", "AWS region")
-var worker = flag.Bool("worker", false, "Run worker node")
+var workerSlots = flag.Int("worker_slots", 0, "Run worker node with concurrent jobs")
+var downloadConcurrency = flag.Int("download_concurrency", 10, "How many concurrent file downloads")
+
+var cacheDir = flag.String("cache_dir", "", "Download cache")
 
 func main() {
 	log.SetOutput(logrus.New().Writer())
 	flag.Parse()
 
 	config := &server.Config{
-		Listen:      *listen,
-		Port:        *port,
-		ClusterName: *clusterName,
-		ClusterHost: *clusterHost,
-		ClusterPort: *clusterPort,
-		Join:        *join,
-		Bucket:      *bucket,
-		Region:      *region,
-		Worker:      *worker,
+		Listen:              *listen,
+		Port:                *port,
+		ClusterName:         *clusterName,
+		ClusterHost:         *clusterHost,
+		ClusterPort:         *clusterPort,
+		Join:                *join,
+		Bucket:              *bucket,
+		Region:              *region,
+		WorkerSlots:         *workerSlots,
+		DownloadConcurrency: *downloadConcurrency,
+		CacheDir:            *cacheDir,
+	}
+
+	if config.CacheDir == "" {
+		config.CacheDir = filepath.Join(os.TempDir(), "bbb_cache")
+	}
+	err := os.MkdirAll(config.CacheDir, fs.FileMode(0755))
+	if err != nil && !os.IsExist(err) {
+		logrus.Fatalf("Could not mkdir cache %q, please set -cache_dir: %v", config.CacheDir, err)
 	}
 
 	_, cancel := context.WithCancel(context.Background())
