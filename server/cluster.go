@@ -1,12 +1,17 @@
 package server
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"os"
+	"sort"
 	"strings"
+	"time"
 
+	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/golang/protobuf/proto"
 	"github.com/hashicorp/serf/serf"
 	"github.com/ricochet1k/buildbuildbuild/server/clusterpb"
@@ -22,8 +27,8 @@ func (c *Server) InitCluster() {
 	events := make(chan serf.Event, 1)
 
 	serfConfig := serf.DefaultConfig()
-	if c.config.ClusterName != "" {
-		serfConfig.NodeName = c.config.ClusterName
+	if c.config.NodeName != "" {
+		serfConfig.NodeName = c.config.NodeName
 	}
 	serfConfig.MemberlistConfig.BindAddr = c.config.ClusterHost
 	serfConfig.MemberlistConfig.BindPort = c.config.ClusterPort
@@ -55,8 +60,13 @@ func (c *Server) InitCluster() {
 	if c.config.Join != "" {
 		_, err = ser.Join(strings.Split(c.config.Join, ","), false)
 		if err != nil {
-			logrus.Printf("WARNING: Failed to join cluster: %v\n", err)
+			logrus.Warnf("Failed to join cluster: %v\n", err)
 		}
+	}
+
+	if c.config.Autojoin != "" && c.config.Autojoin != "false" {
+		key := c.config.Autojoin + ".autojoin-cluster-members"
+		go c.PeriodicSaveAutojoin(key)
 	}
 
 	// Ask for members of the cluster
@@ -65,6 +75,93 @@ func (c *Server) InitCluster() {
 	}
 
 	c.SendState(&clusterpb.NodeState{})
+}
+
+func (c *Server) TryAutojoin(key string) {
+	out, err := c.downloader.S3.GetObject(&s3.GetObjectInput{
+		Bucket: &c.config.Bucket,
+		Key:    &key,
+	})
+	if err == nil {
+		var buf bytes.Buffer
+		_, err = io.Copy(&buf, out.Body)
+		if err == nil {
+			_, err = c.list.Join(strings.Split(string(buf.Bytes()), "\n"), false)
+		}
+	}
+	if err != nil {
+		logrus.Warnf("Failed to autojoin cluster: %v\n", err)
+	}
+}
+
+func (c *Server) PeriodicSaveAutojoin(key string) {
+	for {
+		c.SaveAutojoin(key)
+
+		time.Sleep(time.Duration(rand.Intn(10)) * time.Minute)
+	}
+}
+
+func (c *Server) SaveAutojoin(key string) {
+	if c.list.State() != serf.SerfAlive {
+		return
+	}
+
+	members := c.list.Members()
+	memberJoinUrls := []string{}
+	for _, member := range members {
+		memberJoinUrls = append(memberJoinUrls, fmt.Sprintf("%v:%v\n", member.Addr.String(), member.Port))
+	}
+
+	sort.Strings(memberJoinUrls)
+
+	membersJoinData := strings.Join(memberJoinUrls, "")
+
+	existingAutojoin := ""
+	out, err := c.downloader.S3.GetObject(&s3.GetObjectInput{
+		Bucket: &c.config.Bucket,
+		Key:    &key,
+	})
+	if err == nil {
+		var buf bytes.Buffer
+		_, err = io.Copy(&buf, out.Body)
+		if err == nil {
+			existingAutojoin = string(buf.Bytes())
+		}
+	}
+
+	if existingAutojoin == membersJoinData {
+		return
+	}
+
+	// here we need to make that we don't overwrite the bucket in the rare case of two clusters
+	// not knowing about each other and alternately overwriting the key
+	// all we need to do is check if we know about the members in the existing data
+	// and if we don't, join them
+
+	unknownMembers := []string{}
+	for _, existingMember := range strings.SplitAfter(existingAutojoin, "\n") {
+		if !strings.Contains(membersJoinData, existingMember) {
+			unknownMembers = append(unknownMembers, existingMember[:len(existingMember)-1])
+		}
+	}
+	if len(unknownMembers) > 0 {
+		// this is noisy when members leave
+		logrus.Warnf("Autojoin unknown members: %v", unknownMembers)
+		_, err = c.list.Join(unknownMembers, false)
+		if err != nil {
+			logrus.Warnf("Unable to autojoin: %v", err)
+		}
+	}
+
+	_, err = c.downloader.S3.PutObject(&s3.PutObjectInput{
+		Bucket: &c.config.Bucket,
+		Key:    &key,
+		Body:   bytes.NewReader([]byte(membersJoinData)),
+	})
+	if err != nil {
+		logrus.Warnf("Unable to save autojoin list: %v", err)
+	}
 }
 
 func (c *Server) GracefulStop() {

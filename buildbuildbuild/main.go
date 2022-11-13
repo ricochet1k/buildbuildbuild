@@ -23,10 +23,11 @@ import (
 var listen = flag.String("listen", "127.0.0.1", "listen host")
 var port = flag.Int("port", 1234, "listen port")
 
-var clusterName = flag.String("cluster_name", "", "name of node in cluster")
+var nodeName = flag.String("node_name", "", "name of node in cluster")
 var clusterHost = flag.String("cluster_host", "127.0.0.1", "cluster host")
 var clusterPort = flag.Int("cluster_port", 7946, "cluster port")
-var join = flag.String("join", "", "join cluster ip")
+var autojoin = flag.String("autojoin", "default_cluster", "autojoin cluster details stored in S3 by this key")
+var join = flag.String("join", "", "join cluster ips")
 
 var bucket = flag.String("bucket", "", "S3 bucket")
 var region = flag.String("region", "us-east-1", "AWS region")
@@ -42,9 +43,10 @@ func main() {
 	config := &server.Config{
 		Listen:              *listen,
 		Port:                *port,
-		ClusterName:         *clusterName,
+		NodeName:            *nodeName,
 		ClusterHost:         *clusterHost,
 		ClusterPort:         *clusterPort,
+		Autojoin:            *autojoin,
 		Join:                *join,
 		Bucket:              *bucket,
 		Region:              *region,

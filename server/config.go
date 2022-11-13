@@ -4,9 +4,10 @@ type Config struct {
 	Listen string
 	Port   int
 
-	ClusterName string
+	NodeName    string
 	ClusterHost string
 	ClusterPort int
+	Autojoin    string
 	Join        string
 
 	Bucket              string
