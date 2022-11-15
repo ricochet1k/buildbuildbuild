@@ -13,6 +13,7 @@ import (
 
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/golang/protobuf/proto"
+	"github.com/hashicorp/go-sockaddr/template"
 	"github.com/hashicorp/serf/serf"
 	"github.com/ricochet1k/buildbuildbuild/server/clusterpb"
 	"github.com/sirupsen/logrus"
@@ -26,14 +27,25 @@ import (
 func (c *Server) InitCluster() {
 	events := make(chan serf.Event, 1)
 
+	bindHost, err := template.Parse(c.config.BindHost)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to parse bind_host %q: %v", c.config.BindHost, err))
+	}
+	advertiseHost, err := template.Parse(c.config.AdvertiseHost)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to parse advertise_host %q: %v", c.config.AdvertiseHost, err))
+	}
+
+	logrus.Infof("Bind to: %v:%v, advertise: %v:%v", bindHost, c.config.BindPort, advertiseHost, c.config.AdvertisePort)
+
 	serfConfig := serf.DefaultConfig()
 	if c.config.NodeName != "" {
 		serfConfig.NodeName = c.config.NodeName
 	}
-	serfConfig.MemberlistConfig.BindAddr = c.config.ClusterHost
-	serfConfig.MemberlistConfig.BindPort = c.config.ClusterPort
-	serfConfig.MemberlistConfig.AdvertiseAddr = c.config.ClusterHost
-	serfConfig.MemberlistConfig.AdvertisePort = c.config.ClusterPort
+	serfConfig.MemberlistConfig.BindAddr = bindHost
+	serfConfig.MemberlistConfig.BindPort = c.config.BindPort
+	serfConfig.MemberlistConfig.AdvertiseAddr = advertiseHost
+	serfConfig.MemberlistConfig.AdvertisePort = c.config.AdvertisePort
 	serfConfig.EventCh = events
 	serfConfig.Tags = map[string]string{
 		"grpcPort": fmt.Sprint(c.config.Port),

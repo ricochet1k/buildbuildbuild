@@ -1,14 +1,18 @@
 package server
 
 type Config struct {
+	// GRPC
 	Listen string
 	Port   int
 
-	NodeName    string
-	ClusterHost string
-	ClusterPort int
-	Autojoin    string
-	Join        string
+	// Serf Cluster
+	NodeName      string
+	BindHost      string
+	BindPort      int
+	AdvertiseHost string
+	AdvertisePort int
+	Autojoin      string
+	Join          string
 
 	Bucket              string
 	Region              string

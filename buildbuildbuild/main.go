@@ -15,17 +15,20 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/hashicorp/go-sockaddr/template"
 	"github.com/ricochet1k/buildbuildbuild/server"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 )
 
-var listen = flag.String("listen", "127.0.0.1", "listen host")
+var listen = flag.String("listen", "{{ GetPrivateIP }}", "listen host")
 var port = flag.Int("port", 1234, "listen port")
 
 var nodeName = flag.String("node_name", "", "name of node in cluster")
-var clusterHost = flag.String("cluster_host", "127.0.0.1", "cluster host")
-var clusterPort = flag.Int("cluster_port", 7946, "cluster port")
+var bindHost = flag.String("bind_host", "{{ GetPrivateIP }}", "cluster bind host (go-sockaddr template)")
+var bindPort = flag.Int("bind_port", 7946, "cluster bind port")
+var advertiseHost = flag.String("advertise_host", "{{ GetPrivateIP }}", "advertise host (go-sockaddr template)")
+var advertisePort = flag.Int("advertise_port", 0, "advertise port")
 var autojoin = flag.String("autojoin", "default_cluster", "autojoin cluster details stored in S3 by this key")
 var join = flag.String("join", "", "join cluster ips")
 
@@ -40,12 +43,18 @@ func main() {
 	log.SetOutput(logrus.New().Writer())
 	flag.Parse()
 
+	if *advertisePort == 0 {
+		*advertisePort = *bindPort
+	}
+
 	config := &server.Config{
 		Listen:              *listen,
 		Port:                *port,
 		NodeName:            *nodeName,
-		ClusterHost:         *clusterHost,
-		ClusterPort:         *clusterPort,
+		BindHost:            *bindHost,
+		BindPort:            *bindPort,
+		AdvertiseHost:       *advertiseHost,
+		AdvertisePort:       *advertisePort,
 		Autojoin:            *autojoin,
 		Join:                *join,
 		Bucket:              *bucket,
@@ -66,7 +75,12 @@ func main() {
 	_, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	address := fmt.Sprintf("%v:%v", *listen, *port)
+	listenHost, err := template.Parse(*listen)
+	if err != nil {
+		logrus.Fatalf("Failed to parse listen %q: %v", *listen, err)
+	}
+
+	address := fmt.Sprintf("%v:%v", listenHost, *port)
 	lis, err := net.Listen("tcp", address)
 	if err != nil {
 		logrus.Fatalf("failed to listen: %v", err)
