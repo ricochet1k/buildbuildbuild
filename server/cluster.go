@@ -258,7 +258,7 @@ func (c *Server) BroadcastNodeMessage(msg *clusterpb.NodeMessage) {
 }
 
 func (c *Server) SendState(state *clusterpb.NodeState) {
-	logrus.Printf("Sending state %v\n", state)
+	// logrus.Printf("Sending state %v\n", state)
 	c.BroadcastNodeMessage(&clusterpb.NodeMessage{State: state})
 }
 
@@ -304,7 +304,7 @@ func (c *Server) HandleEvents(events <-chan serf.Event) {
 					continue
 				}
 
-				logrus.Printf("NotifyMsg: %v\n", &msg)
+				// logrus.Printf("NotifyMsg: %v\n", &msg)
 				if msg.State != nil {
 					c.nodeState[msg.From] = msg.State
 					if msg.State.JobsSlotsFree > 0 {
