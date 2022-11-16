@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	execpb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	"github.com/golang/protobuf/proto"
+	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -32,12 +34,14 @@ func (c *Server) GetActionResult(ctx context.Context, req *execpb.GetActionResul
 	var ar execpb.ActionResult
 	err := c.DownloadProto(ctx, key, &ar)
 	if err != nil {
-		fmt.Printf("GetActionResult Err %q %v\n", key, err)
-		c.downloader.S3.DeleteObjectWithContext(ctx, &s3.DeleteObjectInput{
-			Bucket: &c.bucket,
-			Key:    aws.String(key),
-		})
-		return nil, err
+		logrus.Errorf("GetActionResult Err %q (code %v) %v\n", key, status.Code(err), err)
+		if status.Code(err) != codes.NotFound && strings.Contains(err.Error(), "unmarshal") {
+			go c.downloader.S3.DeleteObject(&s3.DeleteObjectInput{
+				Bucket: &c.bucket,
+				Key:    aws.String(key),
+			})
+		}
+		return nil, status.Error(codes.NotFound, err.Error())
 	}
 
 	// check CAS to make sure blobs are still available
@@ -54,7 +58,7 @@ func (c *Server) GetActionResult(ctx context.Context, req *execpb.GetActionResul
 	})
 	if err != nil || len(missing.MissingBlobDigests) > 0 {
 		// couldn't find some blobs, return NotFound so bazel will re-run and re-upload
-		return nil, status.Error(codes.NotFound, err.Error())
+		return nil, status.Error(codes.NotFound, fmt.Sprintf("Missing blobs (%v/%v): %v", len(missing.MissingBlobDigests), len(blobs), err))
 	}
 
 	return &ar, nil
@@ -82,11 +86,11 @@ func (c *Server) GetActionResult(ctx context.Context, req *execpb.GetActionResul
 func (c *Server) UpdateActionResult(ctx context.Context, req *execpb.UpdateActionResultRequest) (*execpb.ActionResult, error) {
 	key := StorageKey(req.InstanceName, CONTENT_ACTION, DigestKey(req.ActionDigest))
 
-	// fmt.Printf("UpdateActionResult %q\n", key)
+	// logrus.Infof("UpdateActionResult %q\n", key)
 
 	body, err := proto.Marshal(req.ActionResult)
 	if err != nil {
-		fmt.Printf("Failed to marshal ActionResult: %v", err)
+		logrus.Errorf("Failed to marshal ActionResult: %v", err)
 		return nil, err
 	}
 
@@ -96,7 +100,7 @@ func (c *Server) UpdateActionResult(ctx context.Context, req *execpb.UpdateActio
 		Key:    aws.String(key),
 	})
 	if err != nil {
-		fmt.Printf("Failed to upload: %v", err)
+		logrus.Errorf("Failed to upload: %v", err)
 		return nil, err
 	}
 
