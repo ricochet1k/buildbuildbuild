@@ -300,9 +300,6 @@ func (c *Server) HandleEvents(events <-chan serf.Event) {
 					fmt.Fprintf(os.Stderr, "Bad message received: %v %q", err, event.Payload)
 					continue
 				}
-				if msg.From == c.list.LocalMember().Name {
-					continue
-				}
 
 				// logrus.Printf("NotifyMsg: %v\n", &msg)
 				if msg.State != nil {
@@ -311,10 +308,10 @@ func (c *Server) HandleEvents(events <-chan serf.Event) {
 						go c.RequestJob(msg.From)
 					}
 				}
-				// if msg.StartJob != nil {
-				// 	c.Subscribe("jobstatus:"+msg.StartJob.Id, RemoteSubscriber(msg.From))
-				// 	c.StartJob(msg.StartJob)
-				// }
+
+				if msg.From == c.list.LocalMember().Name {
+					continue
+				}
 				if msg.Subscribe != "" {
 					c.Subscribe(msg.Subscribe, RemoteSubscriber(msg.From))
 				}
