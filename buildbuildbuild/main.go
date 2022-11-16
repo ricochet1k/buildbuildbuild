@@ -37,6 +37,8 @@ var region = flag.String("region", "us-east-1", "AWS region")
 var workerSlots = flag.Int("worker_slots", 0, "Run worker node with concurrent jobs")
 var downloadConcurrency = flag.Int("download_concurrency", 10, "How many concurrent file downloads")
 
+var noCleanupExecroot = flag.String("no_cleanup_execroot", "", "Don't delete execroot on (fail|all)")
+
 var cacheDir = flag.String("cache_dir", "", "Download cache")
 
 func main() {
@@ -62,6 +64,7 @@ func main() {
 		WorkerSlots:         *workerSlots,
 		DownloadConcurrency: *downloadConcurrency,
 		CacheDir:            *cacheDir,
+		NoCleanupExecroot:   *noCleanupExecroot,
 	}
 
 	if config.CacheDir == "" {

@@ -114,7 +114,7 @@ func (j *RunningJob) UpdateJobStatus(status *clusterpb.JobStatus) {
 	j.c.jobsRunning.Store(j.Id, status)
 }
 
-func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worker_StartJobServer) error {
+func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worker_StartJobServer) (finalerr error) {
 	select {
 	case c.jobSlots <- struct{}{}:
 		defer func() { <-c.jobSlots }()
@@ -147,14 +147,17 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 		return err
 	}
 
-	defer func() {
-		// TODO: debug flag to keep execroot
-		go func() {
-			if err := os.RemoveAll(execroot); err != nil {
-				logrus.Warnf("Unable to remove execroot %q: %v", execroot, err)
+	if c.config.NoCleanupExecroot != "all" {
+		defer func() {
+			if c.config.NoCleanupExecroot != "fail" || finalerr == nil {
+				go func() {
+					if err := os.RemoveAll(execroot); err != nil {
+						logrus.Warnf("Unable to remove execroot %q: %v", execroot, err)
+					}
+				}()
 			}
 		}()
-	}()
+	}
 
 	fmt.Printf("Worker starting job: %v  in %q  %v\n", req.Id, execroot, req.ActionDigest)
 	defer fmt.Printf("Worker job complete: %v\n", req.Id)

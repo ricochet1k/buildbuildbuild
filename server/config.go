@@ -19,4 +19,6 @@ type Config struct {
 	WorkerSlots         int
 	DownloadConcurrency int
 	CacheDir            string
+
+	NoCleanupExecroot string
 }
