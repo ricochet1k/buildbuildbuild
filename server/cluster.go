@@ -122,7 +122,9 @@ func (c *Server) SaveAutojoin(key string) {
 	members := c.list.Members()
 	memberJoinUrls := []string{}
 	for _, member := range members {
-		memberJoinUrls = append(memberJoinUrls, fmt.Sprintf("%v:%v\n", member.Addr.String(), member.Port))
+		if member.Status == serf.StatusAlive {
+			memberJoinUrls = append(memberJoinUrls, fmt.Sprintf("%v:%v\n", member.Addr.String(), member.Port))
+		}
 	}
 
 	sort.Strings(memberJoinUrls)
