@@ -74,6 +74,23 @@ func parseResourceName(resourceName string) (*casResourceName, error) {
 		}, nil
 	}
 
+	// Read shows up like `{instance_name}/blobs/{hash}/{size}`
+	if len(parts) == 4 && parts[1] == "blobs" {
+		size, err := strconv.ParseInt(parts[3], 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		return &casResourceName{
+			instanceName: parts[0],
+			uuid:         "",
+			digest: &execpb.Digest{
+				Hash:      parts[2],
+				SizeBytes: size,
+			},
+			filename: "",
+		}, nil
+	}
+
 	fmt.Printf("BS unrecognized resource_name format: %v\n", resourceName)
 
 	return nil, fmt.Errorf("unrecognized resource_name format")
