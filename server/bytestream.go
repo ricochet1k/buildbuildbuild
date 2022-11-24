@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3"
 	execpb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	"github.com/golang/protobuf/proto"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 	bytestreampb "google.golang.org/genproto/googleapis/bytestream"
 	"google.golang.org/grpc/codes"
@@ -91,7 +92,7 @@ func parseResourceName(resourceName string) (*casResourceName, error) {
 		}, nil
 	}
 
-	fmt.Printf("BS unrecognized resource_name format: %v\n", resourceName)
+	logrus.Infof("BS unrecognized resource_name format: %v\n", resourceName)
 
 	return nil, fmt.Errorf("unrecognized resource_name format")
 }
@@ -106,13 +107,13 @@ func (c *Server) Read(req *bytestreampb.ReadRequest, rs bytestreampb.ByteStream_
 	}
 	key := StorageKey(resname.instanceName, CONTENT_CAS, DigestKey(resname.digest))
 
-	fmt.Printf("ByteStream Downloading %q\n", req.ResourceName)
+	// logrus.Infof("ByteStream Downloading %q\n", req.ResourceName)
 
 	re, wr := io.Pipe()
 	senderr := make(chan error)
 	go func() {
 		defer close(senderr)
-		var buf [5 * 1024]byte
+		var buf [25 * 1024]byte
 		for {
 			n, err := re.Read(buf[:])
 			if err != nil { // EOF or not, we need to close and return
@@ -145,6 +146,14 @@ func (c *Server) Read(req *bytestreampb.ReadRequest, rs bytestreampb.ByteStream_
 	}
 
 	return <-senderr
+}
+
+func MB(bytes int64) float64 {
+	return float64(bytes) / 1000000.0
+}
+
+func MBPS(bytes int64, dur time.Duration) float64 {
+	return MB(bytes) / dur.Seconds()
 }
 
 // `Write()` is used to send the contents of a resource as a sequence of
@@ -181,38 +190,30 @@ func (c *Server) Write(ws bytestreampb.ByteStream_WriteServer) error {
 		return err
 	}
 	key := StorageKey(resname.instanceName, CONTENT_CAS, DigestKey(resname.digest))
+	uploadingKey := "uploading/" + key
 
-	fmt.Printf("ByteStream Uploading %q -> %q\n", resourceName, key)
+	// logrus.Infof("ByteStream Uploading %q -> %q\n", resourceName, key)
 
 	totalBytes := int64(0)
 	c.uploads.Store(resourceName, uploadStatus{
 		committedBytes: totalBytes,
 		complete:       false,
 	})
-	go func() {
-		time.Sleep(10 * time.Minute)
-		c.uploads.Delete(resourceName)
+	defer func() {
+		go func() {
+			time.Sleep(10 * time.Minute)
+			c.uploads.Delete(resourceName)
+		}()
 	}()
 
 	upload, err := c.uploader.S3.CreateMultipartUploadWithContext(ws.Context(), &s3.CreateMultipartUploadInput{
 		Bucket: &c.bucket,
-		Key:    &key,
+		Key:    &uploadingKey,
 	})
 	if err != nil {
-		fmt.Printf(". BS CreateMultipartUpload Error: %v\n", err)
+		logrus.Errorf("BS CreateMultipartUpload Error: %v\n", err)
 		return err
 	}
-
-	completed := false
-	defer func() {
-		if !completed {
-			_, _ = c.uploader.S3.AbortMultipartUploadWithContext(ws.Context(), &s3.AbortMultipartUploadInput{
-				Bucket:   &c.bucket,
-				Key:      &key,
-				UploadId: upload.UploadId,
-			})
-		}
-	}()
 
 	part := int64(1)
 	eg, ctx := errgroup.WithContext(ws.Context())
@@ -222,16 +223,42 @@ func (c *Server) Write(ws bytestreampb.ByteStream_WriteServer) error {
 		partBytes int64
 		number    *int64
 		etag      *string
+		copy      bool
 	}
 
 	completedPartsChan := make(chan *completedPart, 1)
 	allCompletedParts := make(chan []*s3.CompletedPart, 1)
+
+	completed := false
+	defer func() {
+		if !completed {
+			// rather than aborting if the upload didn't finish, we try to complete it anyway since bazel
+			// might try to resume and we are writing to an "uploading" key
+			completedParts := <-allCompletedParts
+			_, err = c.uploader.S3.CompleteMultipartUploadWithContext(ws.Context(), &s3.CompleteMultipartUploadInput{
+				Bucket:   &c.bucket,
+				Key:      &uploadingKey,
+				UploadId: upload.UploadId,
+				MultipartUpload: &s3.CompletedMultipartUpload{
+					Parts: completedParts,
+				},
+			})
+		}
+	}()
+
+	// since uploads can complete out of order, we collect the completed upload parts separately from actually uploading them
 	go func() {
+		start := time.Now()
+		lastSpeedReport := time.Now()
 		nextPart := int64(1)
-		totalBytes := int64(0)
+		totalBytes := int64(0)     // all bytes received
+		committedBytes := int64(0) // all contiguous bytes received
 		pendingPartsMap := map[int64]*completedPart{}
 		completedParts := []*s3.CompletedPart{}
 		for completedPart := range completedPartsChan {
+			if !completedPart.copy {
+				totalBytes += completedPart.partBytes
+			}
 			if *completedPart.number == nextPart {
 				for *completedPart.number == nextPart {
 					nextPart += 1
@@ -239,7 +266,7 @@ func (c *Server) Write(ws bytestreampb.ByteStream_WriteServer) error {
 						ETag:       completedPart.etag,
 						PartNumber: completedPart.number,
 					})
-					totalBytes += completedPart.partBytes
+					committedBytes += completedPart.partBytes
 
 					var ok bool
 					completedPart, ok = pendingPartsMap[nextPart]
@@ -250,15 +277,23 @@ func (c *Server) Write(ws bytestreampb.ByteStream_WriteServer) error {
 				}
 
 				c.uploads.Store(resourceName, uploadStatus{
-					committedBytes: totalBytes,
+					committedBytes: committedBytes,
 					complete:       false,
 				})
 			} else {
 				pendingPartsMap[*completedPart.number] = completedPart
 			}
+
+			if time.Since(lastSpeedReport) > 10*time.Second {
+				lastSpeedReport = time.Now()
+				logrus.Infof("Uploading %v... %.1f committed  %.1f / %.1f MB  %.1f MB/s", nextPart, MB(committedBytes), MB(totalBytes), MB(resname.digest.SizeBytes), MBPS(totalBytes, time.Since(start)))
+			}
 		}
 		if len(pendingPartsMap) > 0 {
-			fmt.Printf("Missing some parts?! %v %v %v", nextPart, pendingPartsMap, completedParts)
+			logrus.Warnf("Missing some parts?! %v %v %v", nextPart, pendingPartsMap, completedParts)
+		}
+		if time.Since(start) > 5*time.Second {
+			logrus.Infof("Upload complete: %v... %.1f / %.1f MB  %.1f MB/s", nextPart, MB(totalBytes), MB(resname.digest.SizeBytes), MBPS(totalBytes, time.Since(start)))
 		}
 		allCompletedParts <- completedParts
 		close(allCompletedParts)
@@ -267,14 +302,14 @@ func (c *Server) Write(ws bytestreampb.ByteStream_WriteServer) error {
 	if req.WriteOffset > 0 {
 		thePart := aws.Int64(part)
 		part += 1
-		fmt.Printf("   BS UploadPartCopy %q\n", resourceName)
+		logrus.Infof("   BS UploadPartCopy %q %v\n", key, req.WriteOffset)
 		eg.Go(func() error {
 			partOutput, err := c.uploader.S3.UploadPartCopyWithContext(ws.Context(), &s3.UploadPartCopyInput{
 				Bucket:          &c.bucket,
-				Key:             &key,
+				Key:             &uploadingKey,
 				UploadId:        upload.UploadId,
 				PartNumber:      thePart,
-				CopySource:      aws.String(fmt.Sprintf("%v/%v", c.bucket, resourceName)),
+				CopySource:      aws.String(fmt.Sprintf("%v/%v", c.bucket, uploadingKey)),
 				CopySourceRange: aws.String(fmt.Sprintf("bytes=0-%v", req.WriteOffset)),
 			})
 			if err != nil {
@@ -284,40 +319,50 @@ func (c *Server) Write(ws bytestreampb.ByteStream_WriteServer) error {
 				partBytes: int64(len(req.Data)),
 				etag:      partOutput.CopyPartResult.ETag,
 				number:    thePart,
+				copy:      true,
 			}
 			return nil
 		})
 	}
 
-	var buf bytes.Buffer
+	minChunkSize := 5 * 1024 * 1024 // S3 required minimum chunk size
+	const maxParts = 10000 - 1
+	if int(resname.digest.SizeBytes/maxParts) > minChunkSize {
+		minChunkSize = int(resname.digest.SizeBytes / maxParts)
+	}
+
+	buf := c.bufPool.Get().(*bytes.Buffer)
 
 	for {
 		_, _ = buf.Write(req.Data)
 
-		if req.FinishWrite || buf.Len() >= 5*1024*1024 {
+		if req.FinishWrite || buf.Len() >= minChunkSize {
 			// closure captures these copies instead of the vars we are still modifying
 			thePart := aws.Int64(part)
 			part += 1
-			theData := buf.Bytes()
-			buf = bytes.Buffer{} // buf.Bytes is not a copy. We re-init buf so we don't overwrite while trying to send
-			// TODO: Pool?
+			theBuf := buf
+			buf = c.bufPool.Get().(*bytes.Buffer)
 
-			totalBytes += int64(len(theData))
+			totalBytes += int64(theBuf.Len())
 
-			// fmt.Printf("   BS UploadPart %q %v %v\n", resourceName, part, len(theData))
+			// logrus.Infof("   BS UploadPart %q %v %v\n", resourceName, part, len(theData))
 			eg.Go(func() error {
+				defer func() {
+					theBuf.Reset()
+					c.bufPool.Put(theBuf)
+				}()
 				partOutput, err := c.uploader.S3.UploadPartWithContext(ctx, &s3.UploadPartInput{
 					Bucket:     &c.bucket,
-					Key:        &key,
+					Key:        &uploadingKey,
 					UploadId:   upload.UploadId,
 					PartNumber: thePart,
-					Body:       bytes.NewReader(theData),
+					Body:       bytes.NewReader(theBuf.Bytes()),
 				})
 				if err != nil {
 					return err
 				}
 				completedPartsChan <- &completedPart{
-					partBytes: int64(len(theData)),
+					partBytes: int64(theBuf.Len()),
 					etag:      partOutput.ETag,
 					number:    thePart,
 				}
@@ -334,30 +379,40 @@ func (c *Server) Write(ws bytestreampb.ByteStream_WriteServer) error {
 			if errors.Is(err, io.EOF) {
 				break
 			}
-			fmt.Printf("   BS Upload Recv Err: %v %v\n", totalBytes, err)
+			logrus.Infof("   BS Upload Recv Err: %v %v\n", totalBytes, err)
 			return err
 		}
 	}
 
 	if err = eg.Wait(); err != nil {
-		fmt.Printf("   BS Upload Wait Err: %v %v\n", totalBytes, err)
+		logrus.Infof("   BS Upload Wait Err: %v %v\n", totalBytes, err)
 		return err
 	}
 
 	close(completedPartsChan)
 	completedParts := <-allCompletedParts
 
-	// fmt.Printf("   BS Complete %q %v\n", resourceName, totalBytes)
+	// logrus.Infof("   BS Complete %q %v\n", resourceName, totalBytes)
 	_, err = c.uploader.S3.CompleteMultipartUploadWithContext(ws.Context(), &s3.CompleteMultipartUploadInput{
 		Bucket:   &c.bucket,
-		Key:      &key,
+		Key:      &uploadingKey,
 		UploadId: upload.UploadId,
 		MultipartUpload: &s3.CompletedMultipartUpload{
 			Parts: completedParts,
 		},
 	})
 	if err != nil {
-		fmt.Printf("   BS Complete Err %v\n", err)
+		logrus.Infof("   BS Complete Err %v\n", err)
+		return err
+	}
+
+	_, err = c.uploader.S3.CopyObjectWithContext(ws.Context(), &s3.CopyObjectInput{
+		Bucket:     &c.bucket,
+		CopySource: aws.String(fmt.Sprintf("%v/%v", c.bucket, uploadingKey)),
+		Key:        &key,
+	})
+	if err != nil {
+		logrus.Infof("   BS Complete Copy Err %v\n", err)
 		return err
 	}
 
@@ -368,7 +423,7 @@ func (c *Server) Write(ws bytestreampb.ByteStream_WriteServer) error {
 
 	completed = true
 
-	// fmt.Printf("   BS SendAndClose %q %v\n", resourceName, totalBytes)
+	// logrus.Infof("   BS SendAndClose %q %v\n", resourceName, totalBytes)
 	return ws.SendAndClose(&bytestreampb.WriteResponse{
 		CommittedSize: totalBytes,
 	})
@@ -396,7 +451,7 @@ func (c *Server) QueryWriteStatus(ctx context.Context, req *bytestreampb.QueryWr
 
 	stat := value.(uploadStatus)
 
-	// fmt.Printf("  QueryWriteStatus: %v %v\n", req.ResourceName, stat)
+	// logrus.Infof("  QueryWriteStatus: %v %v\n", req.ResourceName, stat)
 
 	return &bytestreampb.QueryWriteStatusResponse{
 		CommittedSize: stat.committedBytes,

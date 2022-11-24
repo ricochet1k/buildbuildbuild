@@ -1,6 +1,8 @@
 package server
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 	"sync"
 
@@ -23,6 +25,7 @@ import (
 type Server struct {
 	clusterpb.UnimplementedWorkerServer
 	config                  *Config
+	context                 context.Context
 	bucket                  string
 	sess                    *session.Session
 	uploader                *s3manager.Uploader
@@ -40,6 +43,7 @@ type Server struct {
 	jobQueueMutex           sync.Mutex
 	jobQueue                []func(string) // node name
 	grpcClients             map[string]*grpc.ClientConn
+	bufPool                 sync.Pool
 }
 
 type uploadStatus struct {
@@ -47,7 +51,7 @@ type uploadStatus struct {
 	complete       bool
 }
 
-func NewServer(config *Config, sess *session.Session) (*Server, error) {
+func NewServer(ctx context.Context, config *Config, sess *session.Session) (*Server, error) {
 	uploader := s3manager.NewUploader(sess)
 	downloader := s3manager.NewDownloader(sess)
 	downloaderNoConcurrency := s3manager.NewDownloader(sess, func(d *s3manager.Downloader) { d.Concurrency = 1 })
@@ -74,6 +78,11 @@ func NewServer(config *Config, sess *session.Session) (*Server, error) {
 			subscribers: map[string][]Subscriber{},
 		},
 		grpcClients: map[string]*grpc.ClientConn{},
+		bufPool: sync.Pool{
+			New: func() any {
+				return new(bytes.Buffer)
+			},
+		},
 	}
 
 	if config.WorkerSlots > 0 {

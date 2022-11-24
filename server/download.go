@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -12,12 +13,29 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/s3"
 	execpb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	wrapperspb "github.com/golang/protobuf/ptypes/wrappers"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+type ErrorWithMissingDigests struct {
+	error
+	MissingDigests []*execpb.Digest
+}
+
+func (e ErrorWithMissingDigests) Unwrap() error {
+	return e.error
+}
+
+func WrapErrorWithMissing(err error, missingDigests ...*execpb.Digest) ErrorWithMissingDigests {
+	return ErrorWithMissingDigests{
+		err,
+		missingDigests,
+	}
+}
 
 func (c *Server) CleanOldCacheFiles() {
 	expireBefore := time.Now().Add(-2 * time.Hour)
@@ -56,6 +74,11 @@ func (job *RunningJob) DownloadAll(ctx context.Context, path string, dirDigest *
 	var dir execpb.Directory
 	if err := job.c.DownloadProto(ctx, StorageKey(job.InstanceName, CONTENT_CAS, DigestKey(dirDigest)), &dir); err != nil {
 		logrus.Printf("Worker cannot get dir: %v", err)
+
+		var aerr awserr.Error
+		if errors.As(err, &aerr) && aerr.Code() == s3.ErrCodeNoSuchKey {
+			err = WrapErrorWithMissing(err, dirDigest)
+		}
 
 		return err
 	}
@@ -149,6 +172,10 @@ func (job *RunningJob) DownloadFile(ctx context.Context, path string, fileNode *
 	if err != nil { // need to download to cache
 		err = job.DownloadFileToCache(ctx, cachepath, dkey, fileNode.Digest.SizeBytes)
 		if err != nil {
+			var aerr awserr.Error
+			if errors.As(err, &aerr) && aerr.Code() == s3.ErrCodeNoSuchKey {
+				err = WrapErrorWithMissing(err, fileNode.Digest)
+			}
 			return err
 		}
 

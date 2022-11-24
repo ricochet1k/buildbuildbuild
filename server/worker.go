@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -187,8 +188,9 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 		log.Printf("Worker cannot get action: %v", err)
 
 		job.UpdateJobStatus(&clusterpb.JobStatus{
-			Stage: execpb.ExecutionStage_COMPLETED,
-			Error: status.New(codes.FailedPrecondition, fmt.Sprintf("Missing action %v", req.ActionDigest)).Proto(),
+			Stage:         execpb.ExecutionStage_UNKNOWN,
+			Error:         status.New(codes.FailedPrecondition, fmt.Sprintf("Missing action %v", req.ActionDigest)).Proto(),
+			MissingDigest: []*execpb.Digest{req.ActionDigest},
 		})
 		return err
 	}
@@ -197,20 +199,23 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 		logrus.Printf("Action platform: %v", action.Platform)
 	}
 
+	var command execpb.Command
+	eg.Go(func() error {
+		err := c.DownloadProto(ctx, StorageKey(req.InstanceName, CONTENT_CAS, DigestKey(action.CommandDigest)), &command)
+
+		if err != nil {
+			err = WrapErrorWithMissing(err, action.CommandDigest)
+		}
+
+		return err
+	})
+
 	// start := time.Now()
+	job.UpdateJobStatus(&clusterpb.JobStatus{
+		Stage: execpb.ExecutionStage_CACHE_CHECK,
+	})
 	metadata.InputFetchStartTimestamp = timestamppb.Now()
 	eg.Go(func() error { return job.DownloadAll(egctx, "", action.InputRootDigest) })
-
-	var command execpb.Command
-	if err := c.DownloadProto(ctx, StorageKey(req.InstanceName, CONTENT_CAS, DigestKey(action.CommandDigest)), &command); err != nil {
-		logrus.Printf("Worker cannot get command: %v", err)
-
-		job.UpdateJobStatus(&clusterpb.JobStatus{
-			Stage: execpb.ExecutionStage_COMPLETED,
-			Error: status.New(codes.FailedPrecondition, fmt.Sprintf("Missing command %v", action.CommandDigest)).Proto(),
-		})
-		return err
-	}
 
 	// waitingForDownload := make(chan struct{})
 	// go func() {
@@ -235,11 +240,18 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 	if err != nil {
 		logrus.Printf("Worker cannot get inputRoot: %v", err)
 
-		job.UpdateJobStatus(&clusterpb.JobStatus{
-			Stage: execpb.ExecutionStage_COMPLETED,
+		jobStatus := &clusterpb.JobStatus{
+			Stage: execpb.ExecutionStage_UNKNOWN,
 			Error: status.New(codes.FailedPrecondition, fmt.Sprintf("Input fetch: %v", err)).Proto(),
-		})
-		return err
+		}
+
+		var withMissing ErrorWithMissingDigests
+		if errors.As(err, &withMissing) {
+			jobStatus.MissingDigest = withMissing.MissingDigests
+		}
+
+		job.UpdateJobStatus(jobStatus)
+		return nil
 	}
 
 	// make sure all output path dirs exist
@@ -253,7 +265,7 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 					Stage: execpb.ExecutionStage_UNKNOWN,
 					Error: status.New(codes.FailedPrecondition, fmt.Sprintf("Cannot mkdir output dir %q: %v", path, err)).Proto(),
 				})
-				return err
+				return nil
 			}
 		}
 	} else {
@@ -266,7 +278,7 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 					Stage: execpb.ExecutionStage_UNKNOWN,
 					Error: status.New(codes.FailedPrecondition, fmt.Sprintf("Cannot mkdir output dir %q: %v", path, err)).Proto(),
 				})
-				return err
+				return nil
 			}
 		}
 
@@ -279,7 +291,7 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 					Stage: execpb.ExecutionStage_UNKNOWN,
 					Error: status.New(codes.FailedPrecondition, fmt.Sprintf("Cannot mkdir output dir %q: %v", path, err)).Proto(),
 				})
-				return err
+				return nil
 			}
 		}
 	}
@@ -302,11 +314,7 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 	metadata.ExecutionStartTimestamp = timestamppb.Now()
 	err = cmd.Run()
 	metadata.ExecutionCompletedTimestamp = timestamppb.Now()
-	logrus.Printf("Running Complete!")
-
-	job.UpdateJobStatus(&clusterpb.JobStatus{
-		Stage: execpb.ExecutionStage_COMPLETED,
-	})
+	logrus.Printf("Running Complete! %v", err)
 
 	actionResult := &execpb.ActionResult{
 		ExecutionMetadata: metadata,
@@ -322,7 +330,12 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 				Message: "Command execution failed",
 			},
 		})
+		return nil
 	}
+
+	job.UpdateJobStatus(&clusterpb.JobStatus{
+		Stage: execpb.ExecutionStage_COMPLETED,
+	})
 
 	// upload outputs
 	metadata.OutputUploadStartTimestamp = timestamppb.Now()
@@ -334,7 +347,7 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 					Stage: execpb.ExecutionStage_COMPLETED,
 					Error: status.New(codes.FailedPrecondition, err.Error()).Proto(),
 				})
-				return err
+				return nil
 			}
 		}
 	} else {
@@ -347,7 +360,7 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 					Stage: execpb.ExecutionStage_COMPLETED,
 					Error: status.New(codes.FailedPrecondition, err.Error()).Proto(),
 				})
-				return err
+				return nil
 			}
 
 			if isdir {
@@ -355,7 +368,7 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 					Stage: execpb.ExecutionStage_COMPLETED,
 					Error: status.New(codes.FailedPrecondition, fmt.Sprintf("OutputFile is a directory: %v", path)).Proto(),
 				})
-				return err
+				return nil
 			}
 		}
 
@@ -367,7 +380,7 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 					Stage: execpb.ExecutionStage_COMPLETED,
 					Error: status.New(codes.FailedPrecondition, err.Error()).Proto(),
 				})
-				return err
+				return nil
 			}
 
 			if !isdir {
@@ -375,7 +388,7 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 					Stage: execpb.ExecutionStage_COMPLETED,
 					Error: status.New(codes.FailedPrecondition, fmt.Sprintf("OutputDirectory is a file: %v", path)).Proto(),
 				})
-				return err
+				return nil
 			}
 		}
 	}
@@ -387,7 +400,7 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 			Stage: execpb.ExecutionStage_COMPLETED,
 			Error: status.New(codes.FailedPrecondition, fmt.Sprintf("Upload failed: %v", err)).Proto(),
 		})
-		return err
+		return nil
 	}
 	metadata.OutputUploadCompletedTimestamp = timestamppb.Now()
 

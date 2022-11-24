@@ -7,17 +7,22 @@ import (
 	"io/fs"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"sync"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/hashicorp/go-sockaddr/template"
 	"github.com/ricochet1k/buildbuildbuild/server"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 )
 
@@ -48,6 +53,12 @@ func main() {
 	if *advertisePort == 0 {
 		*advertisePort = *bindPort
 	}
+	if *cacheDir == "" {
+		*cacheDir = filepath.Join(os.TempDir(), "bbb_cache")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	config := &server.Config{
 		Listen:              *listen,
@@ -67,16 +78,10 @@ func main() {
 		NoCleanupExecroot:   *noCleanupExecroot,
 	}
 
-	if config.CacheDir == "" {
-		config.CacheDir = filepath.Join(os.TempDir(), "bbb_cache")
-	}
 	err := os.MkdirAll(config.CacheDir, fs.FileMode(0755))
 	if err != nil && !os.IsExist(err) {
 		logrus.Fatalf("Could not mkdir cache %q, please set -cache_dir: %v", config.CacheDir, err)
 	}
-
-	_, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	listenHost, err := template.Parse(*listen)
 	if err != nil {
@@ -95,40 +100,76 @@ func main() {
 		Region: aws.String(*region),
 	}))
 
-	c, err := server.NewServer(config, sess)
+	c, err := server.NewServer(ctx, config, sess)
 	if err != nil {
 		logrus.Fatalf("Unable to list objects in bucket %q: %v\n", *bucket, err)
 	}
 	c.Register(grpcServer)
 	c.InitCluster()
 
+	// logrus.Printf("Listening for GRPC on %s\n", address)
+	// err = grpcServer.Serve(lis)
+	// if err != nil {
+	// 	logrus.Fatalf("could not serve: %v", err)
+	// }
+
+	h2server := &http2.Server{
+		// MaxHandlers:                  0,
+		// MaxConcurrentStreams:         0,
+		// MaxReadFrameSize:             0,
+		// PermitProhibitedCipherSuites: false,
+		// IdleTimeout:                  0,
+		// MaxUploadBufferPerConnection: 0,
+		// MaxUploadBufferPerStream:     0,
+		// NewWriteScheduler: func() http2.WriteScheduler {
+		// },
+		// CountError: func(errType string) {
+		// },
+	}
+
+	h1server := &http.Server{
+		Handler: h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.ProtoMajor == 2 && strings.HasPrefix(
+				r.Header.Get("Content-Type"), "application/grpc") {
+				grpcServer.ServeHTTP(w, r)
+			} else {
+				http.DefaultServeMux.ServeHTTP(w, r)
+			}
+		}), h2server),
+	}
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	wg := sync.WaitGroup{}
-	wg.Add(1)
+	eg, _ := errgroup.WithContext(context.Background())
 	go func() {
 		s := <-sigCh
 		logrus.Printf("got signal %v, attempting graceful shutdown", s)
 		cancel()
-		wg.Add(1)
-		go func() {
+
+		shutdownctx, shutdowncancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer shutdowncancel()
+		eg.Go(func() error {
 			c.GracefulStop()
-			wg.Done()
-		}()
-		wg.Add(1)
-		go func() {
-			grpcServer.GracefulStop()
-			wg.Done()
-		}()
-		wg.Done()
+			return nil
+		})
+		// this isn't supported when using grpcServer.ServeHTTP
+		// eg.Go(func() error {
+		// 	grpcServer.GracefulStop()
+		// 	return nil
+		// })
+		eg.Go(func() error {
+			return h1server.Shutdown(shutdownctx)
+		})
 	}()
 
-	logrus.Printf("Listening for GRPC on %s\n", address)
-	err = grpcServer.Serve(lis)
-	if err != nil {
-		logrus.Fatalf("could not serve: %v", err)
+	logrus.Infof("Serving at %v", lis.Addr())
+	if err = h1server.Serve(lis); err != nil {
+		logrus.Errorf("Serve: %v", err)
 	}
 
-	wg.Wait()
-	logrus.Println("Graceful shutdown")
+	if err := eg.Wait(); err != nil {
+		logrus.Errorf("Shutdown error: %v", err)
+	} else {
+		logrus.Infoln("Graceful shutdown")
+	}
 }

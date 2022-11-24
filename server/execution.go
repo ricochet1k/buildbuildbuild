@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/google/uuid"
@@ -14,6 +16,7 @@ import (
 	execpb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	"github.com/ricochet1k/buildbuildbuild/server/clusterpb"
 	longrunningpb "google.golang.org/genproto/googleapis/longrunning"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/protobuf/types/known/anypb"
 	emptypb "google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -44,6 +47,24 @@ func jobStatusToOperation(jobId string, msg *clusterpb.JobStatus) *longrunningpb
 		// StdoutStreamName: "",
 		// StderrStreamName: "",
 	})
+
+	if len(msg.MissingDigest) > 0 {
+		violations := []*errdetails.PreconditionFailure_Violation{}
+
+		for _, digest := range msg.MissingDigest {
+			violations = append(violations, &errdetails.PreconditionFailure_Violation{
+				Type:    "MISSING",
+				Subject: fmt.Sprintf("blobs/%v/%v", digest.Hash, digest.SizeBytes),
+			})
+		}
+
+		logrus.Warnf("Job status missing digests: %v", violations)
+
+		pf, _ := anypb.New(&errdetails.PreconditionFailure{
+			Violations: violations,
+		})
+		msg.Error.Details = append(msg.Error.Details, pf)
+	}
 
 	op := &longrunningpb.Operation{
 		Name:     jobId,
@@ -178,7 +199,9 @@ func (c *Server) Execute(req *execpb.ExecuteRequest, es execpb.Execution_Execute
 
 					status, err = stream.Recv()
 					if err != nil {
-						logrus.Printf("Received err from JobStatus: %v", err)
+						if !errors.Is(err, io.EOF) {
+							logrus.Printf("Received err from JobStatus: %v", err)
+						}
 						break
 					}
 

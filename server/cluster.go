@@ -270,7 +270,7 @@ func (c *Server) HandleEvents(events <-chan serf.Event) {
 			switch event.EventType() {
 			case serf.EventMemberJoin:
 				for _, member := range event.Members {
-					logrus.Printf("Node join: %v %v\n", member.Name, member.Tags)
+					logrus.Printf("Node join: %v %v %v\n", member.Name, member.Addr, member.Tags)
 				}
 			case serf.EventMemberLeave:
 				for _, member := range event.Members {

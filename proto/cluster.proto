@@ -45,6 +45,7 @@ message JobStatus {
 	build.bazel.remote.execution.v2.ExecuteResponse response = 2;
 	google.rpc.Status error = 3;
 	build.bazel.remote.execution.v2.Digest action_digest = 4;
+	repeated build.bazel.remote.execution.v2.Digest missing_digest = 5;
 }
 
 service Worker {

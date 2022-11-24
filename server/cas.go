@@ -61,7 +61,7 @@ func (c *Server) FindMissingBlobs(ctx context.Context, req *execpb.FindMissingBl
 		missingDigests = append(missingDigests, digest)
 	}
 
-	logrus.Printf("FindMissingBlobs missing: %v", missingDigests)
+	// logrus.Printf("FindMissingBlobs missing: %v", missingDigests)
 
 	return &execpb.FindMissingBlobsResponse{
 		MissingBlobDigests: missingDigests,
