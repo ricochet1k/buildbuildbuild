@@ -320,6 +320,10 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 		ExecutionMetadata: metadata,
 	}
 	if err != nil {
+		var exiterr *exec.ExitError
+		if errors.As(err, &exiterr) {
+			actionResult.ExitCode = int32(exiterr.ExitCode())
+		}
 		job.UpdateJobStatus(&clusterpb.JobStatus{
 			Stage: execpb.ExecutionStage_COMPLETED,
 			Response: &execpb.ExecuteResponse{

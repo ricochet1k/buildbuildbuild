@@ -115,7 +115,8 @@ func (c *Server) Read(req *bytestreampb.ReadRequest, rs bytestreampb.ByteStream_
 		for {
 			n, err := re.Read(buf[:])
 			if err != nil { // EOF or not, we need to close and return
-				re.Close()
+				re.CloseWithError(err)
+				senderr <- err
 				return
 			}
 			err = rs.Send(&bytestreampb.ReadResponse{
@@ -139,9 +140,12 @@ func (c *Server) Read(req *bytestreampb.ReadRequest, rs bytestreampb.ByteStream_
 		Key:    &key,
 		Range:  dlrange,
 	})
+	wr.CloseWithError(err)
 	if err != nil {
 		return err
 	}
+
+	// logrus.Infof("ByteStream Download done %q\n", req.ResourceName)
 
 	return <-senderr
 }

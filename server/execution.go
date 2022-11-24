@@ -39,8 +39,6 @@ func (c *Server) RequestJob(node string) {
 }
 
 func jobStatusToOperation(jobId string, msg *clusterpb.JobStatus) *longrunningpb.Operation {
-	logrus.Printf("job status! %v\n", msg)
-
 	metadata, _ := anypb.New(&execpb.ExecuteOperationMetadata{
 		Stage:        msg.Stage,
 		ActionDigest: msg.ActionDigest,
@@ -168,8 +166,7 @@ func (c *Server) Execute(req *execpb.ExecuteRequest, es execpb.Execution_Execute
 	handleJobStatus := func(status *clusterpb.JobStatus) {
 		op := jobStatusToOperation(job.Id, status)
 
-		err := es.Send(op)
-		if err != nil {
+		if err := es.Send(op); err != nil {
 			logrus.Printf("Error sending longrunning.Operation: %v", err)
 		}
 	}
@@ -303,12 +300,9 @@ func (c *Server) WaitExecution(req *execpb.WaitExecutionRequest, wes execpb.Exec
 			break
 		}
 
-		logrus.Printf("job status! %v\n", status)
-
 		op := jobStatusToOperation(req.Name, status)
 
-		err = wes.Send(op)
-		if err != nil {
+		if err = wes.Send(op); err != nil {
 			logrus.Printf("Error sending longrunning.Operation: %v", err)
 			break
 		}
