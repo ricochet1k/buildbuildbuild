@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -15,6 +16,7 @@ import (
 	execpb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	"github.com/golang/protobuf/proto"
 	"github.com/ricochet1k/buildbuildbuild/server/clusterpb"
+	"github.com/ricochet1k/buildbuildbuild/utils"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
@@ -25,12 +27,21 @@ import (
 func (c *Server) InitWorker() {
 	c.jobSlots = make(chan struct{}, c.config.WorkerSlots)
 	go func() {
+		running := 0
+		slotsFree := 0
 		for {
-			time.Sleep(5 * time.Second)
-			c.SendState(&clusterpb.NodeState{
-				JobsRunning:   int32(len(c.jobSlots)),
-				JobsSlotsFree: int32(cap(c.jobSlots)) - int32(len(c.jobSlots)),
-			})
+			time.Sleep(1 * time.Second)
+
+			runningNow := len(c.jobSlots)
+			freeNow := cap(c.jobSlots) - runningNow
+			if runningNow != running || freeNow != slotsFree {
+				running = runningNow
+				slotsFree = freeNow
+				c.SendState(&clusterpb.NodeState{
+					JobsRunning:   int32(running),
+					JobsSlotsFree: int32(slotsFree),
+				})
+			}
 		}
 	}()
 
@@ -160,8 +171,8 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 		}()
 	}
 
-	fmt.Printf("Worker starting job: %v  in %q  %v\n", req.Id, execroot, req.ActionDigest)
-	defer fmt.Printf("Worker job complete: %v\n", req.Id)
+	// logrus.Infof("Worker starting job: %v  in %q  %v\n", req.Id, execroot, req.ActionDigest)
+	// defer logrus.Infof("Worker job complete: %v\n", req.Id)
 
 	eg, egctx := errgroup.WithContext(ctx)
 	// eg.SetLimit(c.config.DownloadConcurrency)
@@ -210,32 +221,31 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 		return err
 	})
 
-	// start := time.Now()
+	start := time.Now()
 	job.UpdateJobStatus(&clusterpb.JobStatus{
 		Stage: execpb.ExecutionStage_CACHE_CHECK,
 	})
 	metadata.InputFetchStartTimestamp = timestamppb.Now()
 	eg.Go(func() error { return job.DownloadAll(egctx, "", action.InputRootDigest) })
 
-	// waitingForDownload := make(chan struct{})
-	// go func() {
-	// 	done := false
-	// 	for !done {
-	// 		select {
-	// 		case <-time.NewTimer(5 * time.Second).C:
-	// 		case <-waitingForDownload:
-	// 			done = true
-	// 		}
+	waitingForDownload := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-time.NewTimer(5 * time.Second).C:
+			case <-waitingForDownload:
+				return
+			}
 
-	// 		downloadDuration := time.Since(start)
-	// 		mbs := float64(atomic.LoadInt64(&job.downloadedBytes)) / 1000000.0
-	// 		mbstotal := float64(atomic.LoadInt64(&job.inputBytes)) / 1000000.0
-	// 		logrus.Printf("Downloading %.1f/%.1f MB for %.1f... (maybe waiting for others)", mbs, mbstotal, downloadDuration)
-	// 	}
-	// }()
+			downloadDuration := time.Since(start)
+			downloadedBytes := int(atomic.LoadInt64(&job.downloadedBytes))
+			inputBytes := int(atomic.LoadInt64(&job.inputBytes))
+			logrus.Printf("Downloading %.1f/%.1f MB for %.1f...", utils.MB(downloadedBytes), utils.MB(inputBytes), downloadDuration.Seconds())
+		}
+	}()
 
 	err = job.eg.Wait()
-	// close(waitingForDownload)
+	close(waitingForDownload)
 	metadata.InputFetchCompletedTimestamp = timestamppb.Now()
 	if err != nil {
 		logrus.Printf("Worker cannot get inputRoot: %v", err)
@@ -310,16 +320,18 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	logrus.Printf("Running: %v in %v", cmd.Args, cmd.Dir)
+	// logrus.Printf("Running: %v in %v", cmd.Args, cmd.Dir)
 	metadata.ExecutionStartTimestamp = timestamppb.Now()
 	err = cmd.Run()
 	metadata.ExecutionCompletedTimestamp = timestamppb.Now()
-	logrus.Printf("Running Complete! %v", err)
+	// logrus.Printf("Running Complete! %v", err)
 
 	actionResult := &execpb.ActionResult{
 		ExecutionMetadata: metadata,
 	}
 	if err != nil {
+		logrus.Printf("Job Execute error: %q in %v: %v", cmd.Args, cmd.Dir, err)
+
 		var exiterr *exec.ExitError
 		if errors.As(err, &exiterr) {
 			actionResult.ExitCode = int32(exiterr.ExitCode())
@@ -408,6 +420,8 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 	}
 	metadata.OutputUploadCompletedTimestamp = timestamppb.Now()
 
+	metadata.WorkerCompletedTimestamp = timestamppb.Now()
+
 	job.UpdateJobStatus(&clusterpb.JobStatus{
 		Stage: execpb.ExecutionStage_COMPLETED,
 		Response: &execpb.ExecuteResponse{
@@ -418,6 +432,13 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 			Message: "This is a Message",
 		},
 	})
+
+	downloadedBytes := int(atomic.LoadInt64(&job.downloadedBytes))
+	downloadDur := metadata.InputFetchCompletedTimestamp.AsTime().Sub(metadata.InputFetchStartTimestamp.AsTime())
+	executeDur := metadata.ExecutionCompletedTimestamp.AsTime().Sub(metadata.ExecutionStartTimestamp.AsTime())
+	uploadDur := metadata.OutputUploadCompletedTimestamp.AsTime().Sub(metadata.OutputUploadStartTimestamp.AsTime())
+	totalDur := metadata.WorkerCompletedTimestamp.AsTime().Sub(metadata.WorkerStartTimestamp.AsTime())
+	logrus.Infof("Worker job breakdown: %.1f MB / %v download, %v execute, %v upload, %v total (%v unknown)", utils.MB(downloadedBytes), downloadDur, executeDur, uploadDur, totalDur, totalDur-(downloadDur+executeDur+uploadDur))
 
 	return nil
 }

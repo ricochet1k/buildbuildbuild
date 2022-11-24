@@ -28,13 +28,13 @@ func (c *Server) QueueJob(f func(string)) {
 	c.jobQueue = append(c.jobQueue, f)
 }
 
-func (c *Server) RequestJob(node string) {
+func (c *Server) RequestJobs(node string, n int) {
 	c.jobQueueMutex.Lock()
 	defer c.jobQueueMutex.Unlock()
-	if len(c.jobQueue) > 0 {
+	for i := 0; i < n && len(c.jobQueue) > 0; i++ {
 		job := c.jobQueue[len(c.jobQueue)-1]
 		c.jobQueue = c.jobQueue[:len(c.jobQueue)-1]
-		job(node)
+		go job(node)
 	}
 }
 
@@ -172,7 +172,7 @@ func (c *Server) Execute(req *execpb.ExecuteRequest, es execpb.Execution_Execute
 	}
 
 	startJob := func(node string) error {
-		logrus.Printf("Sending job to %v: %v\n", node, job.Id)
+		// logrus.Printf("Sending job to %v: %v\n", node, job.Id)
 
 		conn, err := c.ConnectToMember(node)
 		if err == nil {
@@ -184,17 +184,19 @@ func (c *Server) Execute(req *execpb.ExecuteRequest, es execpb.Execution_Execute
 			}
 
 			// read first message to see if it actually started
-			status, err := stream.Recv()
+			jobStatus, err := stream.Recv()
 			if err != nil {
-				logrus.Printf("Received initial err from JobStatus: %v", err)
+				if status.Code(err) != codes.ResourceExhausted { // worker job slots already full
+					logrus.Printf("Received initial err from JobStatus: %v", err)
+				}
 				return err
 			}
 
 			go func() {
 				for {
-					handleJobStatus(status)
+					handleJobStatus(jobStatus)
 
-					status, err = stream.Recv()
+					jobStatus, err = stream.Recv()
 					if err != nil {
 						if !errors.Is(err, io.EOF) {
 							logrus.Printf("Received err from JobStatus: %v", err)
@@ -217,7 +219,7 @@ func (c *Server) Execute(req *execpb.ExecuteRequest, es execpb.Execution_Execute
 			return
 		}
 
-		logrus.Printf("Queueing job: %v\n", job.Id)
+		// logrus.Printf("Queueing job: %v\n", job.Id)
 		c.QueueJob(startJobQueued)
 	}
 
@@ -232,7 +234,7 @@ func (c *Server) Execute(req *execpb.ExecuteRequest, es execpb.Execution_Execute
 		}
 	}
 	if !started {
-		logrus.Printf("Queueing job: %v\n", job.Id)
+		// logrus.Printf("Queueing job: %v\n", job.Id)
 		handleJobStatus(&clusterpb.JobStatus{
 			Stage: execpb.ExecutionStage_QUEUED,
 		})

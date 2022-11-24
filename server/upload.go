@@ -17,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	execpb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	"github.com/golang/protobuf/proto"
+	"github.com/ricochet1k/buildbuildbuild/utils"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 )
@@ -289,8 +290,9 @@ func (job *RunningJob) UploadFile(ctx context.Context, path string) (*execpb.Dig
 		}
 
 		uploadDuration := time.Since(start)
-		mbs := float64(digest.SizeBytes) / 1000000.0
-		logrus.Printf("UploadFile  %.1f MB took %v (%.1f MB/s)  %v", mbs, uploadDuration, mbs/uploadDuration.Seconds(), path)
+		if uploadDuration > 1*time.Second {
+			logrus.Printf("UploadFile  %.1f MB took %v (%.1f MB/s)  %v", utils.MB(int(digest.SizeBytes)), uploadDuration, utils.MBPS(int(digest.SizeBytes), uploadDuration), path)
+		}
 		return nil
 	})
 

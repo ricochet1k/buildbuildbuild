@@ -18,6 +18,7 @@ import (
 	execpb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	wrapperspb "github.com/golang/protobuf/ptypes/wrappers"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -211,6 +212,17 @@ func (job *RunningJob) DownloadFile(ctx context.Context, path string, fileNode *
 	return nil
 }
 
+type writerAtWriter struct {
+	w   io.WriterAt
+	off int64
+}
+
+func (w *writerAtWriter) Write(p []byte) (int, error) {
+	n, err := w.w.WriteAt(p, w.off)
+	w.off += int64(n)
+	return n, err
+}
+
 func (job *RunningJob) DownloadFileToCache(ctx context.Context, cachepath string, digestKey string, size int64) error {
 	// logrus.Printf("DownloadFileToCache %v", cachepath)
 
@@ -231,21 +243,42 @@ func (job *RunningJob) DownloadFileToCache(ctx context.Context, cachepath string
 
 		start := time.Now()
 
-		// This downloader downloads one Part first to see the total size of the file before starting parallel
-		// downloads. Since we know the size already, we could download a bit faster than this one.
-		// downloader := s3manager.NewDownloader(job.c.sess, func(d *s3manager.Downloader) { d.PartSize = 20 * 1000 * 1000 })
-		n, err := job.c.downloader.DownloadWithContext(ctx, f, &s3.GetObjectInput{
-			Bucket: &job.c.bucket,
-			Key:    aws.String(key),
-		})
-		if err != nil {
-			return fmt.Errorf("Download %q: %w", key, err)
+		// The s3manager downloader downloads one Part first to see the total size of the file before starting parallel
+		// downloads. Since we know the size already, we can download a bit faster than this one.
+
+		eg, egctx := errgroup.WithContext(ctx)
+
+		partSize := int64(6 * 1024 * 1024)
+		if size/35 > partSize {
+			partSize = size / 35
 		}
-		atomic.AddInt64(&job.downloadedBytes, n)
+		parts := size/partSize + 1
+
+		for i := int64(0); i < parts; i++ {
+			startOffset := i * partSize
+			eg.Go(func() error {
+				out, err := job.c.downloader.S3.GetObjectWithContext(egctx, &s3.GetObjectInput{
+					Bucket: &job.c.bucket,
+					Key:    aws.String(key),
+					Range:  aws.String(fmt.Sprintf("bytes=%v-%v", startOffset, startOffset+partSize)),
+				})
+				if err != nil {
+					return fmt.Errorf("Download %q: %w", key, err)
+				}
+				n, err := io.Copy(&writerAtWriter{f, startOffset}, out.Body)
+				atomic.AddInt64(&job.downloadedBytes, n)
+				return err
+			})
+		}
+		if err := eg.Wait(); err != nil {
+			return err
+		}
 
 		dur := time.Since(start)
-		mbsize := float64(size) / 1000000
-		log.Printf("DownloadFileToCache %v: %.1f MB took %v (%.1f MB/s)", cachepath, mbsize, dur, mbsize/dur.Seconds())
+		mbsize := float64(size) / 1000000.0
+		if dur > 1*time.Second {
+			log.Printf("DownloadFileToCache %v: %.1f MB took %v (%.1f MB/s)", cachepath, mbsize, dur, mbsize/dur.Seconds())
+		}
 	}
 
 	if err := os.Rename(dlpath, cachepath); err != nil {

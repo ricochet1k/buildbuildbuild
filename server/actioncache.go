@@ -3,10 +3,12 @@ package server
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	execpb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
@@ -34,13 +36,21 @@ func (c *Server) GetActionResult(ctx context.Context, req *execpb.GetActionResul
 	var ar execpb.ActionResult
 	err := c.DownloadProto(ctx, key, &ar)
 	if err != nil {
-		logrus.Errorf("GetActionResult Err %q (code %v) %v\n", key, status.Code(err), err)
-		if status.Code(err) != codes.NotFound && strings.Contains(err.Error(), "unmarshal") {
+		var aerr awserr.Error
+		if errors.As(err, &aerr) && aerr.Code() == s3.ErrCodeNoSuchKey {
+			return nil, status.Error(codes.NotFound, err.Error())
+		}
+
+		logrus.Errorf("GetActionResult Err %q (code %v) %v", key, status.Code(err), err)
+		if strings.Contains(err.Error(), "unmarshal") {
+			// Could not unmarshal probably means a corrupt protobuf uploaded
+			logrus.Errorf("GetActionResult deleting probably corrupt object")
 			go c.downloader.S3.DeleteObject(&s3.DeleteObjectInput{
 				Bucket: &c.bucket,
 				Key:    aws.String(key),
 			})
 		}
+
 		return nil, status.Error(codes.NotFound, err.Error())
 	}
 

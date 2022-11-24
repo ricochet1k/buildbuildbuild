@@ -305,7 +305,7 @@ func (c *Server) HandleEvents(events <-chan serf.Event) {
 				if msg.State != nil {
 					c.nodeState[msg.From] = msg.State
 					if msg.State.JobsSlotsFree > 0 {
-						go c.RequestJob(msg.From)
+						c.RequestJobs(msg.From, int(msg.State.JobsSlotsFree))
 					}
 				}
 
