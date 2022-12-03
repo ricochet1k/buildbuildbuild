@@ -8,14 +8,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/s3"
 	execpb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
-	"github.com/golang/protobuf/proto"
 	"github.com/ricochet1k/buildbuildbuild/server/clusterpb"
+	"github.com/ricochet1k/buildbuildbuild/storage"
 	"github.com/ricochet1k/buildbuildbuild/utils"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
@@ -26,49 +26,33 @@ import (
 
 func (c *Server) InitWorker() {
 	c.jobSlots = make(chan struct{}, c.config.WorkerSlots)
-	go func() {
-		running := 0
-		slotsFree := 0
-		for {
-			time.Sleep(1 * time.Second)
-
-			runningNow := len(c.jobSlots)
-			freeNow := cap(c.jobSlots) - runningNow
-			if runningNow != running || freeNow != slotsFree {
-				running = runningNow
-				slotsFree = freeNow
-				c.SendState(&clusterpb.NodeState{
-					JobsRunning:   int32(running),
-					JobsSlotsFree: int32(slotsFree),
-				})
-			}
-		}
-	}()
-
-	// periodically clean the cache to keep the disk from filling up
-	go func() {
-		for {
-			time.Sleep(5 * time.Minute)
-			c.CleanOldCacheFiles()
-		}
-	}()
+	go c.PeriodicSendState()
 }
 
-func (c *Server) DownloadProto(ctx context.Context, key string, msg proto.Message) error {
-	var b aws.WriteAtBuffer
-	_, err := c.downloader.DownloadWithContext(ctx, &b, &s3.GetObjectInput{
-		Bucket: &c.bucket,
-		Key:    &key,
-	})
-	if err != nil {
-		return err
-	}
+func (c *Server) PeriodicSendState() {
+	time.Sleep(1 * time.Second)
 
-	if err := proto.Unmarshal(b.Bytes(), msg); err != nil {
-		return err
-	}
+	lastMemberCount := 0
+	running := 0
+	slotsFree := 0
+	lastSend := time.Now()
+	for {
+		runningNow := len(c.jobSlots)
+		freeNow := cap(c.jobSlots) - runningNow
+		memberCount := len(c.list.Members())
+		if time.Since(lastSend) > 20*time.Second || lastMemberCount != memberCount || runningNow != running || freeNow != slotsFree {
+			lastMemberCount = memberCount
+			running = runningNow
+			slotsFree = freeNow
+			lastSend = time.Now()
+			c.SendState(&clusterpb.NodeState{
+				JobsRunning:   int32(running),
+				JobsSlotsFree: int32(slotsFree),
+			})
+		}
 
-	return nil
+		time.Sleep(1 * time.Second)
+	}
 }
 
 // FollowJob implements clusterpb.WorkerServer
@@ -107,14 +91,16 @@ func (c *Server) FollowJob(req *clusterpb.FollowJobRequest, stream clusterpb.Wor
 }
 
 type RunningJob struct {
-	Id              string
-	InstanceName    string
-	ExecRoot        string
-	ActionDigest    *execpb.Digest
-	inputBytes      int64
-	downloadedBytes int64
-	c               *Server
-	eg              *errgroup.Group
+	Id                string
+	InstanceName      string
+	ExecRoot          string
+	ActionDigest      *execpb.Digest
+	inputBytes        int64
+	downloadedBytes   int64
+	c                 *Server
+	eg                *errgroup.Group
+	missingBlobsMutex sync.Mutex
+	missingBlobs      []*execpb.Digest
 }
 
 func (j *RunningJob) UpdateJobStatus(status *clusterpb.JobStatus) {
@@ -133,6 +119,8 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 	default:
 		return status.Error(codes.ResourceExhausted, "Cannot start job, slots full")
 	}
+
+	logrus.Infof("Starting job %v %v (%v)", req.RequestMetadata.ActionMnemonic, req.RequestMetadata.TargetId, req.RequestMetadata.ToolInvocationId)
 
 	metadata := &execpb.ExecutedActionMetadata{
 		Worker:          c.list.LocalMember().Name,
@@ -174,7 +162,8 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 	// logrus.Infof("Worker starting job: %v  in %q  %v\n", req.Id, execroot, req.ActionDigest)
 	// defer logrus.Infof("Worker job complete: %v\n", req.Id)
 
-	eg, egctx := errgroup.WithContext(ctx)
+	// we aren't using egctx here because we want to give the client the full list of missing blobs if there are any, rather than cutting them short after the first one
+	eg, _ := errgroup.WithContext(ctx)
 	// eg.SetLimit(c.config.DownloadConcurrency)
 	job := &RunningJob{
 		Id:           req.Id,
@@ -195,8 +184,9 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 	})
 
 	var action execpb.Action
-	if err := c.DownloadProto(ctx, StorageKey(req.InstanceName, CONTENT_CAS, DigestKey(req.ActionDigest)), &action); err != nil {
-		log.Printf("Worker cannot get action: %v", err)
+	actionKey := storage.BlobKey{InstanceName: req.InstanceName, Kind: storage.CONTENT_CAS, Digest: req.ActionDigest.Hash, Size: int(req.ActionDigest.SizeBytes)}
+	if err := c.DownloadProto(ctx, actionKey, &action); err != nil {
+		log.Printf("Worker cannot get action %v: %v", actionKey, err)
 
 		job.UpdateJobStatus(&clusterpb.JobStatus{
 			Stage:         execpb.ExecutionStage_UNKNOWN,
@@ -211,11 +201,11 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 	}
 
 	var command execpb.Command
+	commandKey := storage.BlobKey{InstanceName: req.InstanceName, Kind: storage.CONTENT_CAS, Digest: action.CommandDigest.Hash, Size: int(action.CommandDigest.SizeBytes)}
 	eg.Go(func() error {
-		err := c.DownloadProto(ctx, StorageKey(req.InstanceName, CONTENT_CAS, DigestKey(action.CommandDigest)), &command)
-
+		err := c.DownloadProto(ctx, commandKey, &command)
 		if err != nil {
-			err = WrapErrorWithMissing(err, action.CommandDigest)
+			job.AddMissing(action.CommandDigest)
 		}
 
 		return err
@@ -226,7 +216,7 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 		Stage: execpb.ExecutionStage_CACHE_CHECK,
 	})
 	metadata.InputFetchStartTimestamp = timestamppb.Now()
-	eg.Go(func() error { return job.DownloadAll(egctx, "", action.InputRootDigest) })
+	eg.Go(func() error { return job.DownloadAll(ctx, "", action.InputRootDigest) })
 
 	waitingForDownload := make(chan struct{})
 	go func() {
@@ -248,16 +238,15 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 	close(waitingForDownload)
 	metadata.InputFetchCompletedTimestamp = timestamppb.Now()
 	if err != nil {
-		logrus.Printf("Worker cannot get inputRoot: %v", err)
-
-		jobStatus := &clusterpb.JobStatus{
-			Stage: execpb.ExecutionStage_UNKNOWN,
-			Error: status.New(codes.FailedPrecondition, fmt.Sprintf("Input fetch: %v", err)).Proto(),
+		logrus.Errorf("Worker cannot get inputRoot: %v", err)
+		if len(job.missingBlobs) > 0 {
+			logrus.Errorf("MissingBlobs: %v", job.missingBlobs)
 		}
 
-		var withMissing ErrorWithMissingDigests
-		if errors.As(err, &withMissing) {
-			jobStatus.MissingDigest = withMissing.MissingDigests
+		jobStatus := &clusterpb.JobStatus{
+			Stage:         execpb.ExecutionStage_UNKNOWN,
+			Error:         status.New(codes.FailedPrecondition, fmt.Sprintf("Input fetch: %v", err)).Proto(),
+			MissingDigest: job.missingBlobs,
 		}
 
 		job.UpdateJobStatus(jobStatus)
@@ -313,6 +302,8 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 	cmdctx, cancel := context.WithTimeout(ctx, time.Hour)
 	defer cancel()
 	cmd := exec.CommandContext(cmdctx, command.Arguments[0], command.Arguments[1:]...)
+	// put subprocesses in a new group
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Dir = filepath.Join(execroot, command.WorkingDirectory)
 	for _, envvar := range command.EnvironmentVariables {
 		cmd.Env = append(cmd.Env, envvar.Name+"="+envvar.Value)
@@ -325,6 +316,11 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 	err = cmd.Run()
 	metadata.ExecutionCompletedTimestamp = timestamppb.Now()
 	// logrus.Printf("Running Complete! %v", err)
+
+	// If there are any left-over processes, kill them.
+	// This works in tandem with Setpgid above, which puts them into a
+	// new process group numbered by the pid, which kill can target if it is negative.
+	syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 
 	actionResult := &execpb.ActionResult{
 		ExecutionMetadata: metadata,
@@ -358,7 +354,7 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 	if len(command.OutputPaths) > 0 {
 		for _, path := range command.OutputPaths {
 			if _, err := job.UploadOutputPath(ctx, actionResult, path); err != nil {
-				logrus.Error(err)
+				logrus.Error("Upload Output path %q: %v", path, err)
 				job.UpdateJobStatus(&clusterpb.JobStatus{
 					Stage: execpb.ExecutionStage_COMPLETED,
 					Error: status.New(codes.FailedPrecondition, err.Error()).Proto(),
@@ -371,7 +367,7 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 		for _, path := range command.OutputFiles {
 			isdir, err := job.UploadOutputPath(ctx, actionResult, path)
 			if err != nil {
-				logrus.Error(err)
+				logrus.Errorf("Upload Output file %q: %v", path, err)
 				job.UpdateJobStatus(&clusterpb.JobStatus{
 					Stage: execpb.ExecutionStage_COMPLETED,
 					Error: status.New(codes.FailedPrecondition, err.Error()).Proto(),
@@ -391,7 +387,7 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 		for _, path := range command.OutputDirectories {
 			isdir, err := job.UploadOutputPath(ctx, actionResult, path)
 			if err != nil {
-				logrus.Error(err)
+				logrus.Errorf("Upload Output dir %q: %v", path, err)
 				job.UpdateJobStatus(&clusterpb.JobStatus{
 					Stage: execpb.ExecutionStage_COMPLETED,
 					Error: status.New(codes.FailedPrecondition, err.Error()).Proto(),
@@ -420,6 +416,11 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 	}
 	metadata.OutputUploadCompletedTimestamp = timestamppb.Now()
 
+	// logrus.Printf("actionResult: %#v", actionResult)
+	// for _, outfile := range actionResult.OutputFiles {
+	// 	logrus.Printf("outfile: %#v %v", outfile, outfile.Digest)
+	// }
+
 	metadata.WorkerCompletedTimestamp = timestamppb.Now()
 
 	job.UpdateJobStatus(&clusterpb.JobStatus{
@@ -438,7 +439,7 @@ func (c *Server) StartJob(req *clusterpb.StartJobRequest, stream clusterpb.Worke
 	executeDur := metadata.ExecutionCompletedTimestamp.AsTime().Sub(metadata.ExecutionStartTimestamp.AsTime())
 	uploadDur := metadata.OutputUploadCompletedTimestamp.AsTime().Sub(metadata.OutputUploadStartTimestamp.AsTime())
 	totalDur := metadata.WorkerCompletedTimestamp.AsTime().Sub(metadata.WorkerStartTimestamp.AsTime())
-	logrus.Infof("Worker job breakdown: %.1f MB / %v download, %v execute, %v upload, %v total (%v unknown)", utils.MB(downloadedBytes), downloadDur, executeDur, uploadDur, totalDur, totalDur-(downloadDur+executeDur+uploadDur))
+	logrus.Infof("Worker job breakdown: %v %v : %.1f MB / %v download, %v execute, %v upload, %v total (%v unknown)", req.RequestMetadata.ActionMnemonic, req.RequestMetadata.TargetId, utils.MB(downloadedBytes), downloadDur, executeDur, uploadDur, totalDur, totalDur-(downloadDur+executeDur+uploadDur))
 
 	return nil
 }

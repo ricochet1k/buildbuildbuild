@@ -15,6 +15,7 @@ import (
 
 	execpb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	"github.com/ricochet1k/buildbuildbuild/server/clusterpb"
+	"github.com/ricochet1k/buildbuildbuild/utils"
 	longrunningpb "google.golang.org/genproto/googleapis/longrunning"
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -61,6 +62,7 @@ func jobStatusToOperation(jobId string, msg *clusterpb.JobStatus) *longrunningpb
 		pf, _ := anypb.New(&errdetails.PreconditionFailure{
 			Violations: violations,
 		})
+		msg.Error.Code = int32(codes.FailedPrecondition)
 		msg.Error.Details = append(msg.Error.Details, pf)
 	}
 
@@ -154,21 +156,35 @@ func jobStatusToOperation(jobId string, msg *clusterpb.JobStatus) *longrunningpb
 // multiple times, potentially in parallel. These redundant executions MAY
 // continue to run, even if the operation is completed.
 func (c *Server) Execute(req *execpb.ExecuteRequest, es execpb.Execution_ExecuteServer) error {
+	defer func() { es = nil }()
+
+	_, reqmd := utils.ExtractIncomingRequestMetadata(es.Context())
+	// logrus.Debugf("Execute: %#v  reqmd: %v", md, reqmd.String())
+
 	job := &clusterpb.StartJobRequest{
 		Id:              uuid.New().String(),
 		InstanceName:    req.InstanceName,
 		ActionDigest:    req.ActionDigest,
 		SkipCacheLookup: req.SkipCacheLookup,
 		QueuedTimestamp: timestamppb.Now(),
+		RequestMetadata: reqmd,
 	}
-	completed := make(chan struct{})
+	completed := make(chan error)
 
-	handleJobStatus := func(status *clusterpb.JobStatus) {
-		op := jobStatusToOperation(job.Id, status)
+	handleJobStatus := func(jobstatus *clusterpb.JobStatus) error {
+		op := jobStatusToOperation(job.Id, jobstatus)
+
+		if operr, ok := op.Result.(*longrunningpb.Operation_Error); ok {
+			if operr.Error.Code == int32(codes.FailedPrecondition) {
+				return status.FromProto(operr.Error).Err()
+			}
+		}
 
 		if err := es.Send(op); err != nil {
-			logrus.Printf("Error sending longrunning.Operation: %v", err)
+			// logrus.Errorf("Error sending longrunning.Operation: %v", err)
+			return err
 		}
+		return nil
 	}
 
 	startJob := func(node string) error {
@@ -177,9 +193,9 @@ func (c *Server) Execute(req *execpb.ExecuteRequest, es execpb.Execution_Execute
 		conn, err := c.ConnectToMember(node)
 		if err == nil {
 			worker := clusterpb.NewWorkerClient(conn)
-			stream, err := worker.StartJob(es.Context(), job)
+			stream, err := worker.StartJob(context.TODO(), job)
 			if err != nil {
-				logrus.Printf("Error starting job %v: %v\n", node, job.Id)
+				logrus.Printf("Error starting job %v %v: %v\n", node, job.Id, err)
 				return err
 			}
 
@@ -194,7 +210,11 @@ func (c *Server) Execute(req *execpb.ExecuteRequest, es execpb.Execution_Execute
 
 			go func() {
 				for {
-					handleJobStatus(jobStatus)
+					err := handleJobStatus(jobStatus)
+					if err != nil {
+						completed <- err
+						return
+					}
 
 					jobStatus, err = stream.Recv()
 					if err != nil {
@@ -203,7 +223,6 @@ func (c *Server) Execute(req *execpb.ExecuteRequest, es execpb.Execution_Execute
 						}
 						break
 					}
-
 				}
 				close(completed)
 			}()
@@ -241,9 +260,7 @@ func (c *Server) Execute(req *execpb.ExecuteRequest, es execpb.Execution_Execute
 		c.QueueJob(startJobQueued)
 	}
 
-	<-completed
-
-	return nil // status.Error(codes.Unimplemented, "Execute not implemented")
+	return <-completed
 }
 
 // Wait for an execution operation to complete. When the client initially
@@ -298,14 +315,14 @@ func (c *Server) WaitExecution(req *execpb.WaitExecutionRequest, wes execpb.Exec
 	for {
 		status, err := stream.Recv()
 		if err != nil {
-			logrus.Printf("Received err from JobStatus: %v", err)
+			logrus.Errorf("Received err from JobStatus: %v", err)
 			break
 		}
 
 		op := jobStatusToOperation(req.Name, status)
 
 		if err = wes.Send(op); err != nil {
-			logrus.Printf("Error sending longrunning.Operation: %v", err)
+			// logrus.Errorf("Error sending longrunning.Operation: %v", err)
 			break
 		}
 	}

@@ -48,6 +48,7 @@ message JobStatus {
 	repeated build.bazel.remote.execution.v2.Digest missing_digest = 5;
 }
 
+
 service Worker {
 	rpc StartJob (StartJobRequest) returns (stream JobStatus) {}
 	rpc FollowJob (FollowJobRequest) returns (stream JobStatus) {}
@@ -60,6 +61,7 @@ message StartJobRequest {
 	build.bazel.remote.execution.v2.Digest action_digest = 3;
 	bool skip_cache_lookup = 4;
 	google.protobuf.Timestamp queued_timestamp = 5;
+	build.bazel.remote.execution.v2.RequestMetadata request_metadata = 6;
 }
 
 message FollowJobRequest {

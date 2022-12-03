@@ -12,10 +12,10 @@ import (
 // remote endpoint.
 // Only the capabilities of the services supported by the endpoint will
 // be returned:
-// * Execution + CAS + Action Cache endpoints should return both
-//   CacheCapabilities and ExecutionCapabilities.
-// * Execution only endpoints should return ExecutionCapabilities.
-// * CAS + Action Cache only endpoints should return CacheCapabilities.
+//   - Execution + CAS + Action Cache endpoints should return both
+//     CacheCapabilities and ExecutionCapabilities.
+//   - Execution only endpoints should return ExecutionCapabilities.
+//   - CAS + Action Cache only endpoints should return CacheCapabilities.
 //
 // There are no method-specific errors.
 func (c *Server) GetCapabilities(ctx context.Context, req *execpb.GetCapabilitiesRequest) (*execpb.ServerCapabilities, error) {
@@ -27,8 +27,8 @@ func (c *Server) GetCapabilities(ctx context.Context, req *execpb.GetCapabilitie
 			CachePriorityCapabilities:       &execpb.PriorityCapabilities{},
 			MaxBatchTotalSizeBytes:          1024 * 100, // 100kb
 			SymlinkAbsolutePathStrategy:     execpb.SymlinkAbsolutePathStrategy_UNKNOWN,
-			SupportedCompressors:            []execpb.Compressor_Value{},
-			SupportedBatchUpdateCompressors: []execpb.Compressor_Value{},
+			SupportedCompressors:            []execpb.Compressor_Value{execpb.Compressor_ZSTD},
+			SupportedBatchUpdateCompressors: []execpb.Compressor_Value{execpb.Compressor_ZSTD},
 		},
 		ExecutionCapabilities: &execpb.ExecutionCapabilities{
 			DigestFunction: execpb.DigestFunction_SHA256,

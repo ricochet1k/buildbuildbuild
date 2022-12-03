@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -17,14 +16,13 @@ import (
 )
 
 type S3MultipartUploader struct {
-	ctx     context.Context
-	s3api   s3iface.S3API
-	bufPool *sync.Pool
-	bucket  string
-	key     string
-	size    int
+	ctx   context.Context
+	s3api s3iface.S3API
+	// bufPool *utils.BetterPool[*bytes.Buffer]
+	bucket string
+	size   int
 
-	uploadingKey       string
+	key                string
 	uploadId           string
 	minChunkSize       int
 	eg                 *errgroup.Group
@@ -34,9 +32,9 @@ type S3MultipartUploader struct {
 	buf                *bytes.Buffer
 	completedPartsChan chan *completedPart
 	allCompletedParts  chan []*s3.CompletedPart
+	finished           bool
 }
 
-func assertWriter(u *S3MultipartUploader) io.WriteSeeker { return u }
 func assertCloser(u *S3MultipartUploader) io.WriteCloser { return u }
 
 type completedPart struct {
@@ -46,15 +44,14 @@ type completedPart struct {
 	copy      bool
 }
 
-func NewS3MultipartUploader(ctx context.Context, s3api s3iface.S3API, bufPool *sync.Pool, bucket, key string, size int) (*S3MultipartUploader, error) {
-	uploadingKey := "uploading/" + key
-
+func NewS3MultipartUploader(ctx context.Context, s3api s3iface.S3API, bufPool *utils.BetterPool[*bytes.Buffer], bucket, key string, size int, metadata map[string]*string) (*S3MultipartUploader, error) {
 	upload, err := s3api.CreateMultipartUploadWithContext(ctx, &s3.CreateMultipartUploadInput{
-		Bucket: &bucket,
-		Key:    &uploadingKey,
+		Bucket:   &bucket,
+		Key:      &key,
+		Metadata: metadata,
 	})
 	if err != nil {
-		logrus.Errorf("BS CreateMultipartUpload Error: %v\n", err)
+		// logrus.Errorf("S3MU CreateMultipartUpload Error: %v\n", err)
 		return nil, err
 	}
 
@@ -113,26 +110,26 @@ func NewS3MultipartUploader(ctx context.Context, s3api s3iface.S3API, bufPool *s
 		if time.Since(start) > 5*time.Second {
 			logrus.Infof("Upload complete: %v... %.1f / %.1f MB  %.1f MB/s", nextPart, utils.MB(totalBytes), utils.MB(size), utils.MBPS(totalBytes, time.Since(start)))
 		}
+		// logrus.Infof("Upload collector complete: %v / %v", totalBytes, committedBytes)
 		allCompletedParts <- completedParts
 		close(allCompletedParts)
 	}()
 
 	minChunkSize := 5 * 1024 * 1024 // S3 required minimum chunk size
 	const maxParts = 10000 - 1
-	if int(size/maxParts) > minChunkSize {
+	if size > 0 && int(size/maxParts) > minChunkSize {
 		minChunkSize = int(size / maxParts)
 	}
 
-	buf := bufPool.Get().(*bytes.Buffer)
+	buf := bufPool.Get()
 
 	return &S3MultipartUploader{
-		ctx:                ctx,
-		s3api:              s3api,
-		bufPool:            bufPool,
+		ctx:   ctx,
+		s3api: s3api,
+		// bufPool:            bufPool,
 		bucket:             bucket,
 		key:                key,
 		size:               size,
-		uploadingKey:       uploadingKey,
 		uploadId:           *upload.UploadId,
 		minChunkSize:       minChunkSize,
 		eg:                 eg,
@@ -144,38 +141,6 @@ func NewS3MultipartUploader(ctx context.Context, s3api s3iface.S3API, bufPool *s
 	}, nil
 }
 
-func (u *S3MultipartUploader) Seek(offset int64, whence int) (int64, error) {
-	if offset == 0 {
-		thePart := u.part
-		u.part += 1
-		logrus.Infof("   BS UploadPartCopy %q %v\n", u.key, whence)
-		u.eg.Go(func() error {
-			partOutput, err := u.s3api.UploadPartCopyWithContext(u.ctx, &s3.UploadPartCopyInput{
-				Bucket:          &u.bucket,
-				Key:             &u.uploadingKey,
-				UploadId:        &u.uploadId,
-				PartNumber:      aws.Int64(int64(thePart)),
-				CopySource:      aws.String(fmt.Sprintf("%v/%v", u.bucket, u.uploadingKey)),
-				CopySourceRange: aws.String(fmt.Sprintf("bytes=0-%v", whence)),
-			})
-			if err != nil {
-				return err
-			}
-			u.completedPartsChan <- &completedPart{
-				partBytes: whence,
-				etag:      partOutput.CopyPartResult.ETag,
-				number:    thePart,
-				copy:      true,
-			}
-			return nil
-		})
-	} else {
-		panic("Wrong use of Seek in S3MultipartUploader")
-	}
-
-	return int64(whence), nil
-}
-
 func (u *S3MultipartUploader) Write(data []byte) (int, error) {
 	err := u.egctx.Err()
 	if err != nil {
@@ -184,7 +149,7 @@ func (u *S3MultipartUploader) Write(data []byte) (int, error) {
 
 	_, _ = u.buf.Write(data)
 
-	if u.buf.Len() >= u.minChunkSize {
+	if u.buf.Len() > u.minChunkSize {
 		u.uploadChunk()
 	}
 
@@ -196,19 +161,16 @@ func (u *S3MultipartUploader) uploadChunk() {
 	thePart := u.part
 	u.part += 1
 	theBuf := u.buf
-	u.buf = u.bufPool.Get().(*bytes.Buffer)
+	u.buf = &bytes.Buffer{} //u.bufPool.Get()
 
 	u.totalBytes += theBuf.Len()
 
-	// logrus.Infof("   BS UploadPart %q %v %v\n", resourceName, part, len(theData))
+	// logrus.Infof("   S3MU UploadPart %q %v %v (total %v)\n", u.key, thePart, theBuf.Len(), u.totalBytes)
 	u.eg.Go(func() error {
-		defer func() {
-			theBuf.Reset()
-			u.bufPool.Put(theBuf)
-		}()
+		// defer u.bufPool.Put(theBuf)
 		partOutput, err := u.s3api.UploadPartWithContext(u.egctx, &s3.UploadPartInput{
 			Bucket:     &u.bucket,
-			Key:        &u.uploadingKey,
+			Key:        &u.key,
 			UploadId:   &u.uploadId,
 			PartNumber: aws.Int64(int64(thePart)),
 			Body:       bytes.NewReader(theBuf.Bytes()),
@@ -225,47 +187,55 @@ func (u *S3MultipartUploader) uploadChunk() {
 	})
 }
 
+func (u *S3MultipartUploader) Finish() error {
+	u.finished = true
+	return nil
+}
+
 func (u *S3MultipartUploader) Close() error {
+	// defer u.bufPool.Put(u.buf)
+
 	if u.buf.Len() >= 0 {
 		u.uploadChunk()
 	}
 
 	if err := u.eg.Wait(); err != nil {
-		logrus.Infof("   BS Upload Wait Err: %v %v\n", u.totalBytes, err)
+		// logrus.Infof("   S3MU Upload Wait Err: %v %v\n", u.totalBytes, err)
 		return err
 	}
 
 	close(u.completedPartsChan)
 	completedParts := <-u.allCompletedParts
 
-	// logrus.Infof("   BS Complete %q %v\n", resourceName, totalBytes)
+	if u.finished && (u.size < 0 || u.totalBytes == u.size) {
+		// logrus.Infof("   S3MU Complete %q %v\n", u.key, u.totalBytes)
 
-	// rather than aborting if the upload didn't finish, we try to complete it anyway since bazel
-	// might try to resume and we are writing to an "uploading" key
-	_, err := u.s3api.CompleteMultipartUploadWithContext(u.ctx, &s3.CompleteMultipartUploadInput{
-		Bucket:   &u.bucket,
-		Key:      &u.uploadingKey,
-		UploadId: &u.uploadId,
-		MultipartUpload: &s3.CompletedMultipartUpload{
-			Parts: completedParts,
-		},
-	})
-	if err != nil {
-		logrus.Infof("   BS Complete Err %v\n", err)
-		return err
-	}
-
-	if u.totalBytes == u.size {
-		_, err = u.s3api.CopyObjectWithContext(u.ctx, &s3.CopyObjectInput{
-			Bucket:     &u.bucket,
-			CopySource: aws.String(fmt.Sprintf("%v/%v", u.bucket, u.uploadingKey)),
-			Key:        &u.key,
+		_, err := u.s3api.CompleteMultipartUploadWithContext(u.ctx, &s3.CompleteMultipartUploadInput{
+			Bucket:   &u.bucket,
+			Key:      &u.key,
+			UploadId: &u.uploadId,
+			MultipartUpload: &s3.CompletedMultipartUpload{
+				Parts: completedParts,
+			},
 		})
 		if err != nil {
-			logrus.Infof("   BS Complete Copy Err %v\n", err)
+			// logrus.Errorf("   S3MU Complete Err %v\n", err)
+			// logrus.Errorf(" %v %# v\n", len(completedParts), completedParts)
 			return err
 		}
 	} else {
+		logrus.Errorf("   S3MU Incomplete %v, %v == %v\n", u.finished, u.totalBytes, u.size)
+
+		_, err := u.s3api.AbortMultipartUploadWithContext(u.ctx, &s3.AbortMultipartUploadInput{
+			Bucket:   &u.bucket,
+			Key:      &u.key,
+			UploadId: &u.uploadId,
+		})
+		if err != nil {
+			// logrus.Errorf("   S3MU Abort Err %v\n", err)
+			return err
+		}
+
 		return fmt.Errorf("Incomplete upload: %v / %v", u.totalBytes, u.size)
 	}
 

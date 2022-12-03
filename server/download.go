@@ -2,23 +2,21 @@ package server
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"io/fs"
-	"log"
 	"os"
 	"path/filepath"
 	"sync/atomic"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/service/s3"
 	execpb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	wrapperspb "github.com/golang/protobuf/ptypes/wrappers"
+	"github.com/ricochet1k/buildbuildbuild/storage"
+	"github.com/ricochet1k/buildbuildbuild/utils"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -31,54 +29,24 @@ func (e ErrorWithMissingDigests) Unwrap() error {
 	return e.error
 }
 
-func WrapErrorWithMissing(err error, missingDigests ...*execpb.Digest) ErrorWithMissingDigests {
-	return ErrorWithMissingDigests{
-		err,
-		missingDigests,
-	}
+func (e ErrorWithMissingDigests) Error() string {
+	return "ErrorWithMissingDigests: " + e.error.Error()
 }
 
-func (c *Server) CleanOldCacheFiles() {
-	expireBefore := time.Now().Add(-2 * time.Hour)
-
-	cleaned := int64(0)
-
-	entries, err := os.ReadDir(c.config.CacheDir)
-	if err != nil {
-		logrus.Warnf("Unable to read cache dir for cleanup: %v", err)
-		return
-	}
-
-	for _, entry := range entries {
-		stat, err := entry.Info()
-		if err != nil {
-			logrus.Warnf("Unable to stat cache entry: %v", err)
-			continue
-		}
-
-		if stat.ModTime().Before(expireBefore) {
-			if err := os.Remove(filepath.Join(c.config.CacheDir, entry.Name())); err != nil {
-				logrus.Warnf("Unable to remove cache entry: %v", err)
-				continue
-			}
-
-			cleaned += stat.Size()
-		}
-	}
-
-	if cleaned > 0 {
-		logrus.Infof("Cleaned %v MB from the cache", float64(cleaned)/1000000)
-	}
+func (job *RunningJob) AddMissing(missingDigests ...*execpb.Digest) {
+	job.missingBlobsMutex.Lock()
+	defer job.missingBlobsMutex.Unlock()
+	job.missingBlobs = append(job.missingBlobs, missingDigests...)
 }
 
 func (job *RunningJob) DownloadAll(ctx context.Context, path string, dirDigest *execpb.Digest) error {
+	key := storage.BlobKey{InstanceName: job.InstanceName, Kind: storage.CONTENT_CAS, Digest: dirDigest.Hash, Size: int(dirDigest.SizeBytes)}
 	var dir execpb.Directory
-	if err := job.c.DownloadProto(ctx, StorageKey(job.InstanceName, CONTENT_CAS, DigestKey(dirDigest)), &dir); err != nil {
-		logrus.Printf("Worker cannot get dir: %v", err)
+	if err := job.c.DownloadProto(ctx, key, &dir); err != nil {
+		logrus.Errorf("Worker cannot get dir %v: %v", key, err)
 
-		var aerr awserr.Error
-		if errors.As(err, &aerr) && aerr.Code() == s3.ErrCodeNoSuchKey {
-			err = WrapErrorWithMissing(err, dirDigest)
+		if status.Code(err) == codes.NotFound {
+			job.AddMissing(dirDigest)
 		}
 
 		return err
@@ -149,20 +117,8 @@ func statToNodeProperties(stat fs.FileInfo) *execpb.NodeProperties {
 }
 
 func (job *RunningJob) DownloadFile(ctx context.Context, path string, fileNode *execpb.FileNode) error {
-	dkey := DigestKey(fileNode.Digest)
-
-	// first check if anything else is downloading already
-	downloaded := make(chan struct{})
-	defer close(downloaded)
-	downloadedChan, alreadyDownloading := job.c.downloading.LoadOrStore(dkey, downloaded)
-	if alreadyDownloading {
-		// logrus.Printf("Already downloading %v...", path)
-		<-downloadedChan.(chan struct{})
-	} else {
-		defer job.c.downloading.Delete(dkey)
-	}
-
-	cachepath := filepath.Join(job.c.config.CacheDir, dkey)
+	key := storage.BlobKey{InstanceName: job.InstanceName, Kind: storage.CONTENT_CAS, Digest: fileNode.Digest.Hash, Size: int(fileNode.Digest.SizeBytes)}
+	cachepath := job.c.CachePath(key)
 
 	// then check if it's already been downloaded
 	cachefile, err := os.Open(cachepath)
@@ -171,13 +127,26 @@ func (job *RunningJob) DownloadFile(ctx context.Context, path string, fileNode *
 	}
 
 	if err != nil { // need to download to cache
-		err = job.DownloadFileToCache(ctx, cachepath, dkey, fileNode.Digest.SizeBytes)
-		if err != nil {
-			var aerr awserr.Error
-			if errors.As(err, &aerr) && aerr.Code() == s3.ErrCodeNoSuchKey {
-				err = WrapErrorWithMissing(err, fileNode.Digest)
+		filename := key.InstancePath()
+
+		// first check if anything else is downloading already
+		downloaded := make(chan struct{})
+		defer close(downloaded)
+		downloadedChan, alreadyDownloading := job.c.downloading.LoadOrStore(filename, downloaded)
+		if alreadyDownloading {
+			// logrus.Printf("Already downloading %v...", path)
+			<-downloadedChan.(chan struct{})
+		} else {
+			defer job.c.downloading.Delete(filename)
+
+			err = job.DownloadFileToCache(ctx, cachepath, key, int(fileNode.Digest.SizeBytes))
+			if err != nil {
+				st := utils.ErrorToStatus(err)
+				if st.Code() == codes.NotFound {
+					job.AddMissing(fileNode.Digest)
+				}
+				return st.Err()
 			}
-			return err
 		}
 
 		cachefile, err = os.Open(cachepath)
@@ -212,77 +181,54 @@ func (job *RunningJob) DownloadFile(ctx context.Context, path string, fileNode *
 	return nil
 }
 
-type writerAtWriter struct {
-	w   io.WriterAt
-	off int64
-}
+func (job *RunningJob) DownloadFileToCache(ctx context.Context, cachepath string, key storage.BlobKey, size int) (finalerr error) {
+	// logrus.Printf("DownloadFileToCache %v %v", cachepath, size)
 
-func (w *writerAtWriter) Write(p []byte) (int, error) {
-	n, err := w.w.WriteAt(p, w.off)
-	w.off += int64(n)
-	return n, err
-}
+	if err := os.MkdirAll(filepath.Dir(cachepath), fs.FileMode(0755)); err != nil {
+		return err
+	}
 
-func (job *RunningJob) DownloadFileToCache(ctx context.Context, cachepath string, digestKey string, size int64) error {
-	// logrus.Printf("DownloadFileToCache %v", cachepath)
-
-	dlpath := cachepath + ".dl"
-
-	f, err := os.OpenFile(dlpath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, os.FileMode(0644))
+	f, err := utils.CreateAtomic(cachepath)
 	if err != nil {
-		return fmt.Errorf("OpenFile failed %q: %w", dlpath, err)
+		return fmt.Errorf("DownloadFileToCache Create failed %q: %w", cachepath, err)
 	}
 	defer f.Close()
 
 	if size > 0 {
-		key := StorageKey(job.InstanceName, CONTENT_CAS, digestKey)
-
-		atomic.AddInt64(&job.inputBytes, size)
+		atomic.AddInt64(&job.inputBytes, int64(size))
 		job.c.downloadConcurrency <- struct{}{}
 		defer func() { <-job.c.downloadConcurrency }()
 
 		start := time.Now()
 
-		// The s3manager downloader downloads one Part first to see the total size of the file before starting parallel
-		// downloads. Since we know the size already, we can download a bit faster than this one.
-
-		eg, egctx := errgroup.WithContext(ctx)
-
-		partSize := int64(6 * 1024 * 1024)
-		if size/35 > partSize {
-			partSize = size / 35
-		}
-		parts := size/partSize + 1
-
-		for i := int64(0); i < parts; i++ {
-			startOffset := i * partSize
-			eg.Go(func() error {
-				out, err := job.c.downloader.S3.GetObjectWithContext(egctx, &s3.GetObjectInput{
-					Bucket: &job.c.bucket,
-					Key:    aws.String(key),
-					Range:  aws.String(fmt.Sprintf("bytes=%v-%v", startOffset, startOffset+partSize)),
-				})
-				if err != nil {
-					return fmt.Errorf("Download %q: %w", key, err)
-				}
-				n, err := io.Copy(&writerAtWriter{f, startOffset}, out.Body)
-				atomic.AddInt64(&job.downloadedBytes, n)
+		if job.c.config.Compress {
+			r, _, err := job.c.DownloadReader(ctx, key, 0, 0)
+			if err != nil {
 				return err
-			})
-		}
-		if err := eg.Wait(); err != nil {
-			return err
+			}
+
+			n, err := io.Copy(f, r)
+			if err != nil {
+				return err
+			}
+			atomic.AddInt64(&job.downloadedBytes, int64(n))
+
+		} else {
+			err := storage.ParallelDownload(ctx, key, size, job.c.Storage, f, &job.downloadedBytes)
+			if err != nil {
+				return err
+			}
 		}
 
 		dur := time.Since(start)
 		mbsize := float64(size) / 1000000.0
 		if dur > 1*time.Second {
-			log.Printf("DownloadFileToCache %v: %.1f MB took %v (%.1f MB/s)", cachepath, mbsize, dur, mbsize/dur.Seconds())
+			logrus.Infof("DownloadFileToCache %v: %.1f MB took %v (%.1f MB/s)", cachepath, mbsize, dur, mbsize/dur.Seconds())
 		}
 	}
 
-	if err := os.Rename(dlpath, cachepath); err != nil {
-		return fmt.Errorf("Rename %q: %w", cachepath, err)
+	if err := f.Finish(); err != nil {
+		return fmt.Errorf("Finish %q: %w", cachepath, err)
 	}
 	return nil
 }

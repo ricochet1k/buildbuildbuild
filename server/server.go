@@ -4,14 +4,18 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"sync"
 
-	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3manager"
+	"github.com/golang/protobuf/proto"
 	"github.com/hashicorp/serf/serf"
 	"github.com/ricochet1k/buildbuildbuild/server/clusterpb"
+	"github.com/ricochet1k/buildbuildbuild/storage"
+	"github.com/ricochet1k/buildbuildbuild/utils"
+	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 
 	assetpb "github.com/bazelbuild/remote-apis/build/bazel/remote/asset/v1"
@@ -24,66 +28,80 @@ import (
 
 type Server struct {
 	clusterpb.UnimplementedWorkerServer
-	config                  *Config
-	context                 context.Context
-	bucket                  string
-	sess                    *session.Session
-	uploader                *s3manager.Uploader
-	downloader              *s3manager.Downloader
-	downloaderNoConcurrency *s3manager.Downloader
-	uploads                 sync.Map
-	metadata                []byte
-	list                    *serf.Serf
-	nodeState               map[string]*clusterpb.NodeState
-	pubsub                  PubSub
-	downloadConcurrency     chan struct{} // semaphore channel pattern
-	jobSlots                chan struct{} // semaphore channel pattern
-	downloading             sync.Map
-	jobsRunning             sync.Map
-	jobQueueMutex           sync.Mutex
-	jobQueue                []func(string) // node name
-	grpcClients             map[string]*grpc.ClientConn
-	bufPool                 sync.Pool
-}
-
-type uploadStatus struct {
-	committedBytes int64
-	complete       bool
+	config  *Config
+	context context.Context
+	bucket  string
+	sess    *session.Session
+	// uploader                *s3manager.Uploader
+	// downloader              *s3manager.Downloader
+	// downloaderNoConcurrency *s3manager.Downloader
+	uploads             sync.Map
+	metadata            []byte
+	list                *serf.Serf
+	nodeState           map[string]*clusterpb.NodeState
+	pubsub              PubSub
+	downloadConcurrency chan struct{} // semaphore channel pattern
+	jobSlots            chan struct{} // semaphore channel pattern
+	downloading         sync.Map
+	jobsRunning         sync.Map
+	jobQueueMutex       sync.Mutex
+	jobQueue            []func(string) // node name
+	grpcClientsMutex    sync.Mutex
+	grpcClients         map[string]*grpc.ClientConn
+	bufPool             utils.BetterPool[*bytes.Buffer]
+	storage.CacheData
+	storage.Storage
+	LocalStorage  storage.Storage
+	CacheStorage  storage.Storage
+	RemoteStorage storage.Storage
 }
 
 func NewServer(ctx context.Context, config *Config, sess *session.Session) (*Server, error) {
-	uploader := s3manager.NewUploader(sess)
-	downloader := s3manager.NewDownloader(sess)
-	downloaderNoConcurrency := s3manager.NewDownloader(sess, func(d *s3manager.Downloader) { d.Concurrency = 1 })
-
-	// list objects as a quick test to make sure S3 works
-	_, err := downloader.S3.ListObjects(&s3.ListObjectsInput{
-		Bucket:  &config.Bucket,
-		MaxKeys: aws.Int64(1),
-	})
-	if err != nil {
-		return nil, err
-	}
-
 	c := &Server{
-		config:                  config,
-		bucket:                  config.Bucket,
-		sess:                    sess,
-		uploader:                uploader,
-		downloader:              downloader,
-		downloaderNoConcurrency: downloaderNoConcurrency,
-		downloadConcurrency:     make(chan struct{}, config.DownloadConcurrency),
-		nodeState:               map[string]*clusterpb.NodeState{},
+		context:             ctx,
+		config:              config,
+		bucket:              config.Bucket,
+		sess:                sess,
+		downloadConcurrency: make(chan struct{}, config.DownloadConcurrency),
+		nodeState:           map[string]*clusterpb.NodeState{},
 		pubsub: PubSub{
 			subscribers: map[string][]Subscriber{},
 		},
 		grpcClients: map[string]*grpc.ClientConn{},
-		bufPool: sync.Pool{
-			New: func() any {
-				return new(bytes.Buffer)
-			},
-		},
+		bufPool:     utils.NewPool(func() *bytes.Buffer { return new(bytes.Buffer) }, func(b *bytes.Buffer) { b.Reset() }),
 	}
+
+	c.LocalStorage = &storage.DiskStorage{
+		Path:    config.CacheDir,
+		BufPool: &c.bufPool,
+	}
+	c.CacheStorage = &storage.CacheStorage{
+		Local:     c.LocalStorage,
+		Server:    c,
+		BufPool:   &c.bufPool,
+		CacheData: &c.CacheData,
+	}
+
+	if config.Bucket != "" {
+		s3store, err := storage.NewS3Storage(sess, config.Bucket, &c.bufPool)
+		if err != nil {
+			return nil, err
+		}
+		c.RemoteStorage = s3store
+
+		c.Storage = &storage.ComboStorage{
+			Cache: c.CacheStorage,
+			Main:  s3store,
+		}
+	} else {
+		c.Storage = c.CacheStorage
+	}
+
+	storageCompressor := execpb.Compressor_IDENTITY
+	if config.Compress {
+		storageCompressor = execpb.Compressor_ZSTD
+	}
+	c.Storage = storage.NewCompressed(c.Storage, storageCompressor)
 
 	if config.WorkerSlots > 0 {
 		c.InitWorker()
@@ -109,22 +127,43 @@ func (c *Server) Register(grpcServer *grpc.Server) {
 	}
 }
 
-const (
-	METADATA_EXPIRES string = "BBB-Expires"
-)
+func (c *Server) CachePath(key storage.BlobKey) string {
+	cachepath := filepath.Join(c.config.CacheDir, key.InstancePath())
+	err := os.MkdirAll(filepath.Dir(cachepath), fs.FileMode(0755))
+	if err != nil {
+		logrus.Warnf("Unable to mkdir cache path %q: %v", cachepath, err)
+	}
+	return cachepath
+}
 
-const (
-	CONTENT_LOG    string = "log"
-	CONTENT_ACTION string = "action"
-	CONTENT_CAS    string = "cas"
-	CONTENT_ASSET  string = "asset"
-)
+func (c *Server) DownloadProto(ctx context.Context, key storage.BlobKey, msg proto.Message) error {
+	key.Metadata.Put("proto", fmt.Sprintf("%T", msg))
+
+	buf, _, err := c.DownloadBytes(ctx, key)
+	if err != nil {
+		return err
+	}
+	// defer c.bufPool.Put(buf)
+
+	return proto.Unmarshal(buf.Bytes(), msg)
+}
+
+func (c *Server) UploadProto(ctx context.Context, key storage.BlobKey, msg proto.Message) error {
+	data, err := proto.Marshal(msg)
+	if err != nil {
+		return err
+	}
+
+	key.Metadata.Put("proto", fmt.Sprintf("%T", msg))
+
+	return c.UploadBytes(ctx, key, data)
+}
 
 // kind: cas/action/log
-func StorageKey(instanceName, kind, suffix string) string {
-	return fmt.Sprintf("%v/%v/%v", instanceName, kind, suffix)
-}
+// func StorageKey(instanceName string, kind storage.ContentKind, suffix string) string {
+// 	return fmt.Sprintf("%v/%v/%v", instanceName, kind, suffix)
+// }
 
-func DigestKey(digest *execpb.Digest) string {
-	return digest.Hash + ":" + fmt.Sprint(digest.SizeBytes)
-}
+// func DigestKey(digest *execpb.Digest) string {
+// 	return digest.Hash + ":" + fmt.Sprint(digest.SizeBytes)
+// }

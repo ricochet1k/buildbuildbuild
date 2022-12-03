@@ -1,18 +1,13 @@
 package server
 
 import (
-	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"strings"
+	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	execpb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
-	"github.com/golang/protobuf/proto"
+	"github.com/ricochet1k/buildbuildbuild/storage"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -31,31 +26,35 @@ import (
 //
 // * `NOT_FOUND`: The requested `ActionResult` is not in the cache.
 func (c *Server) GetActionResult(ctx context.Context, req *execpb.GetActionResultRequest) (*execpb.ActionResult, error) {
-	key := StorageKey(req.InstanceName, CONTENT_ACTION, DigestKey(req.ActionDigest))
+	key := storage.BlobKey{
+		InstanceName: req.InstanceName,
+		Kind:         storage.CONTENT_ACTION,
+		Digest:       req.ActionDigest.Hash,
+		Size:         int(req.ActionDigest.SizeBytes),
+		ExpiresMin:   12 * time.Hour,
+	}
 
 	var ar execpb.ActionResult
 	err := c.DownloadProto(ctx, key, &ar)
 	if err != nil {
-		var aerr awserr.Error
-		if errors.As(err, &aerr) && aerr.Code() == s3.ErrCodeNoSuchKey {
-			return nil, status.Error(codes.NotFound, err.Error())
-		}
-
-		logrus.Errorf("GetActionResult Err %q (code %v) %v", key, status.Code(err), err)
-		if strings.Contains(err.Error(), "unmarshal") {
-			// Could not unmarshal probably means a corrupt protobuf uploaded
-			logrus.Errorf("GetActionResult deleting probably corrupt object")
-			go c.downloader.S3.DeleteObject(&s3.DeleteObjectInput{
-				Bucket: &c.bucket,
-				Key:    aws.String(key),
-			})
+		if status.Code(err) == codes.Unknown {
+			logrus.Errorf("GetActionResult Err %q (code %v) %v", key, status.Code(err), err)
+			if strings.Contains(err.Error(), "unmarshal") {
+				// Could not unmarshal probably means a corrupt protobuf uploaded
+				logrus.Errorf("GetActionResult deleting probably corrupt object")
+				// go c.DeleteObject(&s3.DeleteObjectInput{
+				// 	Bucket: &c.bucket,
+				// 	Key:    aws.String(key.S3Key()),
+				// })
+			}
 		}
 
 		return nil, status.Error(codes.NotFound, err.Error())
 	}
 
 	// check CAS to make sure blobs are still available
-	blobs := []*execpb.Digest{}
+	blobs := make([]*execpb.Digest, 0, 1+len(ar.OutputFiles)+len(ar.OutputDirectories))
+	blobs = append(blobs, req.ActionDigest)
 	for _, file := range ar.OutputFiles {
 		blobs = append(blobs, file.Digest)
 	}
@@ -70,6 +69,8 @@ func (c *Server) GetActionResult(ctx context.Context, req *execpb.GetActionResul
 		// couldn't find some blobs, return NotFound so bazel will re-run and re-upload
 		return nil, status.Error(codes.NotFound, fmt.Sprintf("Missing blobs (%v/%v): %v", len(missing.MissingBlobDigests), len(blobs), err))
 	}
+
+	logrus.Infof("Action result cached: %#v", ar)
 
 	return &ar, nil
 }
@@ -94,25 +95,17 @@ func (c *Server) GetActionResult(ctx context.Context, req *execpb.GetActionResul
 //   - `RESOURCE_EXHAUSTED`: There is insufficient storage space to add the
 //     entry to the cache.
 func (c *Server) UpdateActionResult(ctx context.Context, req *execpb.UpdateActionResultRequest) (*execpb.ActionResult, error) {
-	key := StorageKey(req.InstanceName, CONTENT_ACTION, DigestKey(req.ActionDigest))
+	key := storage.BlobKey{
+		InstanceName: req.InstanceName,
+		Kind:         storage.CONTENT_ACTION,
+		Digest:       req.ActionDigest.Hash,
+		Size:         int(req.ActionDigest.SizeBytes),
+		ExpiresMin:   12 * time.Hour,
+	}
 
 	// logrus.Infof("UpdateActionResult %q\n", key)
 
-	body, err := proto.Marshal(req.ActionResult)
-	if err != nil {
-		logrus.Errorf("Failed to marshal ActionResult: %v", err)
-		return nil, err
-	}
+	err := c.UploadProto(ctx, key, req.ActionResult)
 
-	_, err = c.uploader.UploadWithContext(ctx, &s3manager.UploadInput{
-		Bucket: &c.bucket,
-		Body:   bytes.NewReader(body),
-		Key:    aws.String(key),
-	})
-	if err != nil {
-		logrus.Errorf("Failed to upload: %v", err)
-		return nil, err
-	}
-
-	return req.ActionResult, nil
+	return req.ActionResult, err
 }

@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"sort"
@@ -9,15 +8,19 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/golang/protobuf/proto"
+	"github.com/ricochet1k/buildbuildbuild/storage"
+	"github.com/sirupsen/logrus"
 
 	assetpb "github.com/bazelbuild/remote-apis/build/bazel/remote/asset/v1"
 	execpb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 )
 
 func QualifiersToString(qualifiers []*assetpb.Qualifier) string {
+	if len(qualifiers) == 0 {
+		return ""
+	}
+
 	qualMap := map[string]string{}
 	quals := []string{}
 	for _, qual := range qualifiers {
@@ -30,50 +33,25 @@ func QualifiersToString(qualifiers []*assetpb.Qualifier) string {
 	for _, qual := range quals {
 		qualstr += "," + qual + "=" + qualMap[qual]
 	}
-	return qualstr
+	return " Q " + qualstr
 }
 
-func (c *Server) EnsureExpiresAfter(ctx context.Context, instanceName string, expires time.Time, digests []*execpb.Digest) error {
-	expiresb, err := expires.MarshalText()
-	if err != nil {
-		return err
-	}
-	expiresstr := string(expiresb)
-
+func (c *Server) EnsureExpiresAfter(ctx context.Context, instanceName string, expiresMin time.Duration, digests []*execpb.Digest) error {
 	eg, ctx := errgroup.WithContext(ctx)
 	for _, digest := range digests {
 		digest := digest // avoid closure capture of loop variable that changes
 		eg.Go(func() error {
-			key := StorageKey(instanceName, CONTENT_ASSET, DigestKey(digest))
-			out, err := c.downloader.S3.HeadObjectWithContext(ctx, &s3.HeadObjectInput{
-				Bucket: &c.bucket,
-				Key:    &key,
-			})
+			key := storage.BlobKey{
+				InstanceName: instanceName,
+				Kind:         storage.CONTENT_CAS,
+				Digest:       digest.Hash,
+				Size:         int(digest.SizeBytes),
+				ExpiresMin:   expiresMin,
+			}
+			_, err := c.Exists(ctx, key)
 			if err != nil {
-				fmt.Printf("EnsureExpiresAfter Err %q %v\n", key, err)
+				fmt.Printf("EnsureExpiresAfter Err %v %v\n", key, err)
 				return err
-			}
-
-			refmetadata := out.Metadata
-			refexpiresptr := refmetadata[METADATA_EXPIRES]
-			refexpires := ""
-			if refexpiresptr != nil {
-				refexpires = *refexpiresptr
-			}
-
-			if refexpires < expiresstr {
-				refmetadata[METADATA_EXPIRES] = &expiresstr
-				_, err := c.uploader.S3.CopyObjectWithContext(ctx, &s3.CopyObjectInput{
-					Bucket:     &c.bucket,
-					CopySource: new(string),
-					Expires:    &expires,
-					Key:        &key,
-					Metadata:   refmetadata,
-				})
-				if err != nil {
-					fmt.Printf("EnsureExpiresAfter Err %q %v\n", key, err)
-					return err
-				}
 			}
 
 			return nil
@@ -86,20 +64,14 @@ func (c *Server) EnsureExpiresAfter(ctx context.Context, instanceName string, ex
 	return nil
 }
 
-func (c *Server) UploadAll(ctx context.Context, instanceName string, expires time.Time, uris []string, keysuffix string, metadata map[string]*string, body []byte) error {
+func (c *Server) UploadAll(ctx context.Context, instanceName string, expiresMin time.Duration, uris []string, keysuffix string, metadata storage.Metadata, body []byte) error {
 	eg, ctx := errgroup.WithContext(ctx)
 	for _, uri := range uris {
 		uri := uri // avoid closure capture of loop variable that changes
 		eg.Go(func() error {
-			key := StorageKey(instanceName, CONTENT_ASSET, uri+keysuffix)
-			_, err := c.uploader.UploadWithContext(ctx, &s3manager.UploadInput{
-				Body:     bytes.NewReader(body),
-				Bucket:   &c.bucket,
-				Key:      &key,
-				Expires:  &expires, // this is when cache expires, not when to delete it
-				Metadata: metadata,
-			})
-			return err
+			// TODO: expires
+			key := storage.BlobKey{InstanceName: instanceName, Kind: storage.CONTENT_ASSET, Digest: uri + keysuffix, Size: len(body), Metadata: metadata, ExpiresMin: expiresMin}
+			return c.UploadBytes(ctx, key, body)
 		})
 	}
 	if err := eg.Wait(); err != nil {
@@ -136,36 +108,36 @@ func (c *Server) UploadAll(ctx context.Context, instanceName string, expires tim
 //
 // Errors will be returned as gRPC Status errors.
 // The possible RPC errors include:
-// * `INVALID_ARGUMENT`: One or more arguments to the RPC were invalid.
-// * `RESOURCE_EXHAUSTED`: There is insufficient quota of some resource to
-//   perform the requested operation. The client may retry after a delay.
-// * `UNAVAILABLE`: Due to a transient condition the operation could not be
-//   completed. The client should retry.
-// * `INTERNAL`: An internal error occurred while performing the operation.
-//   The client should retry.
+//   - `INVALID_ARGUMENT`: One or more arguments to the RPC were invalid.
+//   - `RESOURCE_EXHAUSTED`: There is insufficient quota of some resource to
+//     perform the requested operation. The client may retry after a delay.
+//   - `UNAVAILABLE`: Due to a transient condition the operation could not be
+//     completed. The client should retry.
+//   - `INTERNAL`: An internal error occurred while performing the operation.
+//     The client should retry.
 func (c *Server) PushBlob(ctx context.Context, req *assetpb.PushBlobRequest) (*assetpb.PushBlobResponse, error) {
-	expires := req.ExpireAt.AsTime()
+	expiresMin := req.ExpireAt.AsTime().Sub(time.Now())
 	body, _ := proto.Marshal(req)
 
 	qualstr := QualifiersToString(req.Qualifiers)
 
-	metadata := map[string]*string{
-		METADATA_EXPIRES: proto.String(expires.String()),
-	}
+	logrus.Infof("PushBlob: %v %v %v", len(req.Uris), req.Uris[0], qualstr)
+
+	metadata := storage.Metadata{}
 	for _, qual := range req.Qualifiers {
-		metadata["Q-"+qual.Name] = proto.String(qual.Value)
+		metadata.Put("Q-"+qual.Name, qual.Value)
 	}
 
 	// Update the expires metadata on all the blobs
 	digests := []*execpb.Digest{req.BlobDigest}
 	digests = append(digests, req.ReferencesBlobs...)
 	digests = append(digests, req.ReferencesDirectories...)
-	if err := c.EnsureExpiresAfter(ctx, req.InstanceName, expires, digests); err != nil {
+	if err := c.EnsureExpiresAfter(ctx, req.InstanceName, expiresMin, digests); err != nil {
 		fmt.Printf("PushBlob Err %v\n", err)
 		return nil, err
 	}
 
-	if err := c.UploadAll(ctx, req.InstanceName, expires, req.Uris, qualstr, metadata, body); err != nil {
+	if err := c.UploadAll(ctx, req.InstanceName, expiresMin, req.Uris, qualstr, metadata, body); err != nil {
 		fmt.Printf("PushBlob Err %v\n", err)
 		return nil, err
 	}
@@ -175,28 +147,28 @@ func (c *Server) PushBlob(ctx context.Context, req *assetpb.PushBlobRequest) (*a
 
 // this is a near-exact copy of PushBlob :/
 func (c *Server) PushDirectory(ctx context.Context, req *assetpb.PushDirectoryRequest) (*assetpb.PushDirectoryResponse, error) {
-	expires := req.ExpireAt.AsTime()
+	expiresMin := req.ExpireAt.AsTime().Sub(time.Now())
 	body, _ := proto.Marshal(req)
 
 	qualstr := QualifiersToString(req.Qualifiers)
 
-	metadata := map[string]*string{
-		METADATA_EXPIRES: proto.String(expires.String()),
-	}
+	logrus.Infof("PushDirectory: %v %v %v", len(req.Uris), req.Uris[0], qualstr)
+
+	metadata := storage.Metadata{}
 	for _, qual := range req.Qualifiers {
-		metadata["Q-"+qual.Name] = proto.String(qual.Value)
+		metadata.Put("Q-"+qual.Name, qual.Value)
 	}
 
 	// Update the expires metadata on all the blobs
 	digests := []*execpb.Digest{req.RootDirectoryDigest}
 	digests = append(digests, req.ReferencesBlobs...)
 	digests = append(digests, req.ReferencesDirectories...)
-	if err := c.EnsureExpiresAfter(ctx, req.InstanceName, expires, digests); err != nil {
+	if err := c.EnsureExpiresAfter(ctx, req.InstanceName, expiresMin, digests); err != nil {
 		fmt.Printf("PushDirectory Err %v\n", err)
 		return nil, err
 	}
 
-	if err := c.UploadAll(ctx, req.InstanceName, expires, req.Uris, qualstr, metadata, body); err != nil {
+	if err := c.UploadAll(ctx, req.InstanceName, expiresMin, req.Uris, qualstr, metadata, body); err != nil {
 		fmt.Printf("PushDirectory Err %v\n", err)
 		return nil, err
 	}

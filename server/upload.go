@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"fmt"
 	"io"
 	"io/fs"
@@ -12,11 +11,9 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	execpb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	"github.com/golang/protobuf/proto"
+	"github.com/ricochet1k/buildbuildbuild/storage"
 	"github.com/ricochet1k/buildbuildbuild/utils"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
@@ -83,7 +80,7 @@ func (job *RunningJob) UploadOutputPath(ctx context.Context, actionResult *execp
 		}
 		actionResult.OutputFiles = append(actionResult.OutputFiles, outfile)
 		job.eg.Go(func() error {
-			digest, stat, err := job.UploadFile(ctx, path)
+			digest, stat, err := job.UploadFile(ctx, path, job.eg)
 			if err != nil {
 				return err
 			}
@@ -101,14 +98,14 @@ func (job *RunningJob) UploadTree(ctx context.Context, path string) (*execpb.Dig
 	// of proto.Marshal multiple times per directory. See execpb.OutputDirectory.IsTopologicallySorted for more detail.
 	var alldirs []*execpb.Directory
 	var allbytes []*[]byte
-	_, err := job.UploadDirectory(ctx, &alldirs, &allbytes, path)
+	_, err := job.TreeUploadDirectory(ctx, &alldirs, &allbytes, path)
 	if err != nil {
 		return nil, err
 	}
 
 	totalBytesLen := 0
 	for _, bs := range allbytes {
-		totalBytesLen += len(*bs)
+		totalBytesLen += 1 + 4 + len(*bs)
 	}
 
 	// var tree execpb.Tree
@@ -116,14 +113,23 @@ func (job *RunningJob) UploadTree(ctx context.Context, path string) (*execpb.Dig
 	// tree.Children = alldirs[1:]
 	var buf bytes.Buffer
 	buf.Grow(totalBytesLen)
-	buf.WriteByte((1 << 3) | 2) // field 1, wiretype LEN
-	buf.Write(*allbytes[0])
-	for _, bs := range allbytes[1:] {
-		buf.WriteByte((2 << 3) | 2) // field 2, wiretype LEN
+	for i, bs := range allbytes {
+		if i == 0 {
+			buf.WriteByte((1 << 3) | 2) // field 1, wiretype LEN
+		} else {
+			buf.WriteByte((2 << 3) | 2) // field 2, wiretype LEN
+		}
+		buf.Write(proto.EncodeVarint(uint64(len(*bs)))) // length prefix
 		buf.Write(*bs)
 	}
 
 	treebytes := buf.Bytes()
+
+	//sanity check that we can unmarshal it
+	var tree execpb.Tree
+	if err := proto.Unmarshal(treebytes, &tree); err != nil {
+		logrus.Panicf("UploadTree tried to generate an invalid proto: %v.  %q", err, treebytes)
+	}
 
 	h := sha256.New()
 	if _, err := io.Copy(h, bytes.NewReader(treebytes)); err != nil {
@@ -137,23 +143,22 @@ func (job *RunningJob) UploadTree(ctx context.Context, path string) (*execpb.Dig
 	}
 
 	job.eg.Go(func() error {
-		_, err := job.c.uploader.UploadWithContext(ctx, &s3manager.UploadInput{
-			Body:           &buf,
-			Bucket:         &job.c.bucket,
-			ChecksumSHA256: &hash,
-			Key:            aws.String(StorageKey(job.InstanceName, CONTENT_CAS, DigestKey(digest))),
-			Metadata: map[string]*string{
-				"B-Type": aws.String("Tree"),
-				"B-Path": &path,
-			},
-		})
-		return err
+		key := storage.BlobKey{
+			InstanceName: job.InstanceName,
+			Kind:         storage.CONTENT_CAS,
+			Digest:       hash,
+			Size:         len(treebytes),
+			ExpiresMin:   12 * time.Hour,
+		}
+		key.Metadata.Put("proto", fmt.Sprintf("%T", (*execpb.Tree)(nil)))
+		key.Metadata.Put("path", path)
+		return job.c.UploadBytes(ctx, key, treebytes)
 	})
 
 	return digest, nil
 }
 
-func (job *RunningJob) UploadDirectory(ctx context.Context, alldirs *[]*execpb.Directory, allbytes *[]*[]byte, path string) (*execpb.Digest, error) {
+func (job *RunningJob) TreeUploadDirectory(ctx context.Context, alldirs *[]*execpb.Directory, allbytes *[]*[]byte, path string) (*execpb.Digest, error) {
 	var dir execpb.Directory
 	dirbytes := new([]byte)
 	*alldirs = append(*alldirs, &dir)
@@ -164,17 +169,31 @@ func (job *RunningJob) UploadDirectory(ctx context.Context, alldirs *[]*execpb.D
 		return nil, err
 	}
 
-	eg, ctx := errgroup.WithContext(ctx)
+	eg, _ := errgroup.WithContext(ctx)
 
 	for _, entry := range entries {
-		if entry.IsDir() {
+		entrypath := filepath.Join(path, entry.Name())
+		if entry.Type()&fs.ModeSymlink != 0 {
+			target, err := os.Readlink(entrypath)
+			if err != nil {
+				return nil, fmt.Errorf("Cannot readlink %q: %v", entrypath, err)
+			}
+
+			stat, _ := os.Lstat(path)
+
+			dir.Symlinks = append(dir.Symlinks, &execpb.SymlinkNode{
+				Name:           entry.Name(),
+				Target:         target,
+				NodeProperties: statToNodeProperties(stat),
+			})
+		} else if entry.IsDir() {
 			dirnode := &execpb.DirectoryNode{
 				Name: entry.Name(),
 				// Digest: digest,
 			}
 			dir.Directories = append(dir.Directories, dirnode)
 			eg.Go(func() error {
-				digest, err := job.UploadDirectory(ctx, alldirs, allbytes, filepath.Join(path, entry.Name()))
+				digest, err := job.TreeUploadDirectory(ctx, alldirs, allbytes, entrypath)
 				if err != nil {
 					return err
 				}
@@ -190,7 +209,7 @@ func (job *RunningJob) UploadDirectory(ctx context.Context, alldirs *[]*execpb.D
 			}
 			dir.Files = append(dir.Files, filenode)
 			eg.Go(func() error {
-				digest, stat, err := job.UploadFile(ctx, filepath.Join(path, entry.Name()))
+				digest, stat, err := job.UploadFile(ctx, entrypath, eg)
 				if err != nil {
 					return err
 				}
@@ -225,7 +244,7 @@ func (job *RunningJob) UploadDirectory(ctx context.Context, alldirs *[]*execpb.D
 	return digest, nil
 }
 
-func (job *RunningJob) UploadFile(ctx context.Context, path string) (*execpb.Digest, fs.FileInfo, error) {
+func (job *RunningJob) UploadFile(ctx context.Context, path string, eg *errgroup.Group) (*execpb.Digest, fs.FileInfo, error) {
 	fullpath := filepath.Join(job.ExecRoot, path)
 	f, err := os.Open(fullpath)
 	if err != nil {
@@ -242,16 +261,27 @@ func (job *RunningJob) UploadFile(ctx context.Context, path string) (*execpb.Dig
 	if err != nil {
 		return nil, nil, err
 	}
+	size := stat.Size()
 
 	rawhash := h.Sum(nil)
 	hash := fmt.Sprintf("%x", rawhash)
 	digest := &execpb.Digest{
 		Hash:      hash,
-		SizeBytes: stat.Size(),
+		SizeBytes: size,
 	}
 
+	// zero size files don't need to be uploaded
+	if size == 0 {
+		return digest, stat, nil
+	}
+
+	key := storage.BlobKey{InstanceName: job.InstanceName, Kind: storage.CONTENT_CAS, Digest: hash, Size: int(size), ExpiresMin: 12 * time.Hour}
+	key.Metadata.Put("B-Type", "File")
+	key.Metadata.Put("B-Path", path)
+	key.Metadata.Put("B-OutputOf", job.Id)
+
 	// move to cache so future jobs can reuse it without downloading
-	if err := os.Rename(filepath.Join(job.ExecRoot, path), filepath.Join(job.c.config.CacheDir, DigestKey(digest))); err != nil {
+	if err := os.Rename(filepath.Join(job.ExecRoot, path), job.c.CachePath(key)); err != nil {
 		return nil, nil, err
 	}
 
@@ -259,39 +289,47 @@ func (job *RunningJob) UploadFile(ctx context.Context, path string) (*execpb.Dig
 		return nil, nil, err
 	}
 
-	job.eg.Go(func() error {
+	eg.Go(func() error {
 		defer f.Close()
 
-		// check if it exists before uploading
-		key := StorageKey(job.InstanceName, CONTENT_CAS, DigestKey(digest))
-		_, err := job.c.downloader.S3.HeadObjectWithContext(ctx, &s3.HeadObjectInput{
-			Bucket: &job.c.bucket,
-			Key:    &key,
-		})
-		if err == nil {
-			return nil // already uploaded
-		}
-
-		hashb64 := base64.StdEncoding.EncodeToString(rawhash)
-
 		start := time.Now()
-		_, err = job.c.uploader.UploadWithContext(ctx, &s3manager.UploadInput{
-			Body:           f,
-			Bucket:         &job.c.bucket,
-			ChecksumSHA256: &hashb64,
-			Key:            aws.String(key),
-			Metadata: map[string]*string{
-				"B-Type": aws.String("File"),
-				"B-Path": &path,
-			},
+
+		eg, ctx := errgroup.WithContext(ctx)
+
+		// check if it exists, race with uploading
+		eg.Go(func() error {
+			_, err := job.c.Exists(ctx, key)
+			if err == nil {
+				return os.ErrExist
+			}
+			return nil
 		})
-		if err != nil {
-			return err
+
+		eg.Go(func() error {
+			var err error
+			w, err := job.c.UploadWriter(ctx, key)
+			if err != nil {
+				return err
+			}
+			defer w.Close()
+			if _, err := io.Copy(w, f); err != nil {
+				return err
+			}
+			if err := w.Finish(); err != nil {
+				return err
+			}
+			return nil
+		})
+
+		if err := eg.Wait(); err != nil {
+			if err == os.ErrExist {
+				return nil
+			}
 		}
 
 		uploadDuration := time.Since(start)
 		if uploadDuration > 1*time.Second {
-			logrus.Printf("UploadFile  %.1f MB took %v (%.1f MB/s)  %v", utils.MB(int(digest.SizeBytes)), uploadDuration, utils.MBPS(int(digest.SizeBytes), uploadDuration), path)
+			logrus.Printf("UploadFile  %.1f MB took %v (%.1f MB/s)  %v", utils.MB(int(size)), uploadDuration, utils.MBPS(int(size), uploadDuration), path)
 		}
 		return nil
 	})

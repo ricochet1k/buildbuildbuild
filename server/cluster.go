@@ -1,21 +1,23 @@
 package server
 
 import (
-	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"log"
 	"math/rand"
+	"net"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/golang/protobuf/proto"
 	"github.com/hashicorp/go-sockaddr/template"
 	"github.com/hashicorp/serf/serf"
 	"github.com/ricochet1k/buildbuildbuild/server/clusterpb"
+	"github.com/ricochet1k/buildbuildbuild/storage"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
@@ -51,7 +53,7 @@ func (c *Server) InitCluster() {
 		"grpcPort": fmt.Sprint(c.config.Port),
 	}
 	logger := log.New(io.Discard, "", 0)
-	// logger := log.New(logrus.New().Writer(), "", 0)
+	// logger := log.New(logrus.StandardLogger().Writer(), "", 0)
 	serfConfig.Logger = logger
 	serfConfig.MemberlistConfig.Logger = logger
 
@@ -76,9 +78,18 @@ func (c *Server) InitCluster() {
 		}
 	}
 
-	if c.config.Autojoin != "" && c.config.Autojoin != "false" {
-		key := c.config.Autojoin + ".autojoin-cluster-members"
-		go c.PeriodicSaveAutojoin(key)
+	if c.config.AutojoinS3 != "" && c.config.AutojoinS3 != "false" {
+		key := storage.BlobKey{InstanceName: c.config.AutojoinS3, Key: ".autojoin-cluster-members", Size: -1, ExpiresMin: 1 * time.Hour}
+		go c.PeriodicSaveAutojoin(c.context, c.RemoteStorage, key)
+	}
+
+	if c.config.AutojoinUDP != "" && c.config.AutojoinUDP != "false" {
+		broadcast, err := template.Parse(c.config.AutojoinUDP)
+		if err != nil {
+			panic(fmt.Sprintf("Failed to parse autojoin_udp %q: %v", c.config.AutojoinUDP, err))
+		}
+
+		go c.AutojoinUDP(c.context, broadcast)
 	}
 
 	// Ask for members of the cluster
@@ -89,32 +100,129 @@ func (c *Server) InitCluster() {
 	c.SendState(&clusterpb.NodeState{})
 }
 
-func (c *Server) TryAutojoin(key string) {
-	out, err := c.downloader.S3.GetObject(&s3.GetObjectInput{
-		Bucket: &c.config.Bucket,
-		Key:    &key,
-	})
-	if err == nil {
-		var buf bytes.Buffer
-		_, err = io.Copy(&buf, out.Body)
-		if err == nil {
-			_, err = c.list.Join(strings.Split(string(buf.Bytes()), "\n"), false)
-		}
-	}
+func (c *Server) AutojoinUDP(ctx context.Context, broadcast string) {
+	addr, err := net.ResolveUDPAddr("udp", broadcast)
 	if err != nil {
+		logrus.Errorf("%v", err)
+		return
+	}
+
+	udp, err := net.DialUDP("udp", nil, addr)
+	if err != nil {
+		panic(err)
+	}
+	defer udp.Close()
+
+	self := udp.LocalAddr().String()
+
+	packetPrefix := fmt.Sprintf("buildbuildbuild/%v/autojoin/", c.config.ClusterName)
+
+	go func() {
+		reportedError := false
+
+		for {
+			listenAddr := fmt.Sprintf(":%v", addr.AddrPort().Port())
+			pc, err := net.ListenPacket("udp", listenAddr)
+			if err != nil {
+				if !reportedError {
+					logrus.Errorf("UDP listen: %v", err)
+					reportedError = true
+				}
+				time.Sleep(10 * time.Second)
+				continue
+			}
+			defer pc.Close()
+
+			logrus.Infof("Listening for Autojoin messages on UDP %v", listenAddr)
+			buf := make([]byte, 1024)
+			for ctx.Err() == nil {
+				n, addr, err := pc.ReadFrom(buf)
+				if err != nil {
+					logrus.Errorf("UDP read: %v", err)
+				}
+				if addr.String() == self {
+					continue
+				}
+
+				packet := string(buf[:n])
+				// logrus.Infof("UDP packet: %q", packet)
+				if strings.HasPrefix(packet, packetPrefix) {
+					suffix := packet[len(packetPrefix):]
+					if port, err := strconv.Atoi(suffix); err == nil {
+						ipaddr := addr.(*net.UDPAddr)
+
+						node := fmt.Sprintf("%v:%v", ipaddr.IP, port)
+						if c.list.State() == serf.SerfAlive {
+							logrus.Infof("Attempting to join new node: %q", node)
+							if _, err := c.list.Join([]string{node}, true); err != nil {
+								logrus.Errorf("Join failed: %v", err)
+							}
+						}
+					}
+				}
+			}
+		}
+	}()
+
+	whoami := []byte(fmt.Sprintf("%v%v", packetPrefix, c.config.AdvertisePort))
+
+	for ctx.Err() == nil {
+		if c.list.State() == serf.SerfAlive {
+			members := 0
+			for _, member := range c.list.Members() {
+				if member.Status == serf.StatusAlive {
+					members += 1
+				}
+			}
+
+			if members <= 1 {
+				logrus.Infof("Sending UDP Autojoin broadcast to %v", broadcast)
+				_, err = udp.Write(whoami)
+				if err != nil {
+					logrus.Errorf("UDP send: %v", err)
+				}
+			}
+		}
+
+		time.Sleep(5 * time.Second)
+	}
+}
+
+func (c *Server) TryAutojoin(ctx context.Context, store storage.Storage, key storage.BlobKey) {
+	existing, _ := c.GetAutojoinList(ctx, store, key)
+
+	if _, err := c.list.Join(strings.Split(existing, "\n"), false); err != nil {
 		logrus.Warnf("Failed to autojoin cluster: %v\n", err)
 	}
 }
 
-func (c *Server) PeriodicSaveAutojoin(key string) {
-	for {
-		c.SaveAutojoin(key)
+func (c *Server) GetAutojoinList(ctx context.Context, store storage.Storage, key storage.BlobKey) (string, error) {
+	buf, _, err := store.DownloadBytes(ctx, key)
+	if err != nil {
+		logrus.Warnf("Failed to get autojoin list: %v\n", err)
+		return "", err
+	}
 
-		time.Sleep(time.Duration(rand.Intn(10)) * time.Minute)
+	existing := string(buf.Bytes())
+	c.bufPool.Put(buf)
+
+	return existing, err
+}
+
+func (c *Server) PeriodicSaveAutojoin(ctx context.Context, store storage.Storage, key storage.BlobKey) {
+	sleep := 5 * time.Second
+	for {
+		c.SaveAutojoin(ctx, store, key)
+
+		time.Sleep(sleep)
+		sleep *= 2
+		if sleep > 10*time.Minute {
+			sleep = time.Duration(rand.Int63n(int64(10 * time.Minute)))
+		}
 	}
 }
 
-func (c *Server) SaveAutojoin(key string) {
+func (c *Server) SaveAutojoin(ctx context.Context, store storage.Storage, key storage.BlobKey) {
 	if c.list.State() != serf.SerfAlive {
 		return
 	}
@@ -131,18 +239,7 @@ func (c *Server) SaveAutojoin(key string) {
 
 	membersJoinData := strings.Join(memberJoinUrls, "")
 
-	existingAutojoin := ""
-	out, err := c.downloader.S3.GetObject(&s3.GetObjectInput{
-		Bucket: &c.config.Bucket,
-		Key:    &key,
-	})
-	if err == nil {
-		var buf bytes.Buffer
-		_, err = io.Copy(&buf, out.Body)
-		if err == nil {
-			existingAutojoin = string(buf.Bytes())
-		}
-	}
+	existingAutojoin, _ := c.GetAutojoinList(ctx, store, key)
 
 	if existingAutojoin == membersJoinData {
 		return
@@ -162,18 +259,12 @@ func (c *Server) SaveAutojoin(key string) {
 	if len(unknownMembers) > 0 {
 		// this is noisy when members leave
 		logrus.Warnf("Autojoin unknown members: %v", unknownMembers)
-		_, err = c.list.Join(unknownMembers, false)
-		if err != nil {
+		if _, err := c.list.Join(unknownMembers, false); err != nil {
 			logrus.Warnf("Unable to autojoin: %v", err)
 		}
 	}
 
-	_, err = c.downloader.S3.PutObject(&s3.PutObjectInput{
-		Bucket: &c.config.Bucket,
-		Key:    &key,
-		Body:   bytes.NewReader([]byte(membersJoinData)),
-	})
-	if err != nil {
+	if err := store.UploadBytes(ctx, key, []byte(membersJoinData)); err != nil {
 		logrus.Warnf("Unable to save autojoin list: %v", err)
 	}
 }
@@ -186,6 +277,8 @@ func (c *Server) GracefulStop() {
 }
 
 func (c *Server) ConnectToMember(name string) (*grpc.ClientConn, error) {
+	c.grpcClientsMutex.Lock()
+	defer c.grpcClientsMutex.Unlock()
 	if conn, ok := c.grpcClients[name]; ok {
 		// TODO: send Ping
 		if conn.GetState() == connectivity.Idle {
@@ -246,6 +339,10 @@ func (c *Server) SendNodeMessage(node string, msg *clusterpb.NodeMessage) error 
 }
 
 func (c *Server) BroadcastNodeMessage(msg *clusterpb.NodeMessage) {
+	if c.list == nil || c.list.State() != serf.SerfAlive {
+		return
+	}
+
 	msg.From = c.list.LocalMember().Name
 	bytes, err := proto.Marshal(msg)
 	if err != nil {
@@ -292,6 +389,14 @@ func (c *Server) HandleEvents(events <-chan serf.Event) {
 			default:
 				logrus.Printf("Unhandled MemberEvent: %v\n", event.EventType())
 			}
+			members := c.list.Members()
+			memberNames := make([]string, 0, len(members))
+			for _, member := range members {
+				if member.Status == serf.StatusAlive {
+					memberNames = append(memberNames, member.Name)
+				}
+			}
+			c.ClusterMembersUpdated(c.list.LocalMember().Name, memberNames)
 		case serf.UserEvent:
 			switch event.Name {
 			case "msg":

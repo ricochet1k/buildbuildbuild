@@ -6,19 +6,24 @@ type Config struct {
 	Port   int
 
 	// Serf Cluster
+	ClusterName   string
 	NodeName      string
 	BindHost      string
 	BindPort      int
 	AdvertiseHost string
 	AdvertisePort int
-	Autojoin      string
+	AutojoinS3    string
+	AutojoinUDP   string
 	Join          string
+	SecretKey     string
 
+	RequiredHeader      string
 	Bucket              string
 	Region              string
 	WorkerSlots         int
 	DownloadConcurrency int
 	CacheDir            string
+	Compress            bool
 
 	NoCleanupExecroot string
 }

@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"time"
 
@@ -9,11 +8,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	execpb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
-	"github.com/golang/protobuf/proto"
+	"github.com/ricochet1k/buildbuildbuild/storage"
 	"github.com/sirupsen/logrus"
 )
 
@@ -35,14 +31,13 @@ func (c *Server) FindMissingBlobs(ctx context.Context, req *execpb.FindMissingBl
 	missing := make(chan *execpb.Digest)
 	go func() {
 		for _, digest := range req.BlobDigests {
+			if digest == nil {
+				continue
+			}
 			digest := digest // no closure capture bugs
-			key := StorageKey(req.InstanceName, CONTENT_CAS, DigestKey(digest))
+			key := storage.BlobKey{InstanceName: req.InstanceName, Kind: storage.CONTENT_CAS, Digest: digest.Hash, Size: int(digest.SizeBytes), ExpiresMin: 12 * time.Hour}
 			eg.Go(func() error {
-				_, err := c.downloader.S3.HeadObjectWithContext(ctx, &s3.HeadObjectInput{
-					Bucket: &c.bucket,
-					Key:    &key,
-				})
-				if err != nil {
+				if _, err := c.Exists(ctx, key); err != nil {
 					missing <- digest
 				}
 				return nil
@@ -61,7 +56,9 @@ func (c *Server) FindMissingBlobs(ctx context.Context, req *execpb.FindMissingBl
 		missingDigests = append(missingDigests, digest)
 	}
 
-	// logrus.Printf("FindMissingBlobs missing: %v", missingDigests)
+	// if len(missingDigests) > 0 {
+	// 	logrus.Printf("FindMissingBlobs missing: %v", missingDigests)
+	// }
 
 	return &execpb.FindMissingBlobsResponse{
 		MissingBlobDigests: missingDigests,
@@ -93,23 +90,23 @@ func (c *Server) FindMissingBlobs(ctx context.Context, req *execpb.FindMissingBl
 // [Digest][build.bazel.remote.execution.v2.Digest] does not match the
 // provided data.
 func (c *Server) BatchUpdateBlobs(ctx context.Context, reqs *execpb.BatchUpdateBlobsRequest) (*execpb.BatchUpdateBlobsResponse, error) {
-	// default to expiring in a day. Push API or other APIs will kick this forward later if necessary
-	expires := time.Now().Add(24 * time.Hour)
-	metadata := map[string]*string{
-		METADATA_EXPIRES: proto.String(expires.String()),
-	}
+	var fakekey storage.BlobKey
+	fakekey.SetMetadataFromContext(ctx)
 
 	responses := make(chan *execpb.BatchUpdateBlobsResponse_Response)
 	for _, req := range reqs.Requests {
-		go func(req *execpb.BatchUpdateBlobsRequest_Request) {
-			key := StorageKey(reqs.InstanceName, CONTENT_CAS, DigestKey(req.Digest))
-			_, err := c.uploader.UploadWithContext(ctx, &s3manager.UploadInput{
-				Body:     bytes.NewReader(req.Data),
-				Bucket:   &c.bucket,
-				Key:      &key,
-				Expires:  &time.Time{},
-				Metadata: metadata,
-			})
+		req := req
+		go func() {
+			key := storage.BlobKey{
+				InstanceName: reqs.InstanceName,
+				Kind:         storage.CONTENT_CAS,
+				Digest:       req.Digest.Hash,
+				Size:         int(req.Digest.SizeBytes),
+				Compressor:   req.Compressor,
+				Metadata:     fakekey.Metadata,
+				ExpiresMin:   24 * time.Hour,
+			}
+			err := c.UploadBytes(ctx, key, req.Data)
 			if err != nil {
 				logrus.Printf("Upload Error: %v\n", err)
 			}
@@ -120,7 +117,7 @@ func (c *Server) BatchUpdateBlobs(ctx context.Context, reqs *execpb.BatchUpdateB
 				Digest: req.Digest,
 				Status: s.Proto(),
 			}
-		}(req)
+		}()
 	}
 	resps := make([]*execpb.BatchUpdateBlobsResponse_Response, len(reqs.Requests))
 	for i := range reqs.Requests {
@@ -155,27 +152,30 @@ func (c *Server) BatchUpdateBlobs(ctx context.Context, reqs *execpb.BatchUpdateB
 func (c *Server) BatchReadBlobs(ctx context.Context, reqs *execpb.BatchReadBlobsRequest) (*execpb.BatchReadBlobsResponse, error) {
 	responses := make(chan *execpb.BatchReadBlobsResponse_Response)
 	for _, digest := range reqs.Digests {
-		go func(digest *execpb.Digest) {
-			var b aws.WriteAtBuffer
-			key := StorageKey(reqs.InstanceName, CONTENT_CAS, DigestKey(digest))
-			_, err := c.downloader.DownloadWithContext(ctx, &b, &s3.GetObjectInput{
-				Bucket: &c.bucket,
-				Key:    &key,
-			})
+		digest := digest
+		go func() {
+			key := storage.BlobKey{
+				InstanceName: reqs.InstanceName,
+				Kind:         storage.CONTENT_CAS,
+				Digest:       digest.Hash,
+				Size:         int(digest.SizeBytes),
+				Metadata:     map[string]*string{},
+			}
+			buf, _, err := c.DownloadBytes(ctx, key)
 
 			s, _ := status.FromError(err)
 
 			responses <- &execpb.BatchReadBlobsResponse_Response{
-				Digest: digest,
-				Data:   b.Bytes(),
-				// Compressor: 0,
-				Status: s.Proto(),
+				Digest:     digest,
+				Data:       buf.Bytes(),
+				Compressor: execpb.Compressor_IDENTITY,
+				Status:     s.Proto(),
 			}
-		}(digest)
+		}()
 	}
-	resps := make([]*execpb.BatchReadBlobsResponse_Response, len(reqs.Digests))
-	for i := range reqs.Digests {
-		resps[i] = <-responses
+	resps := make([]*execpb.BatchReadBlobsResponse_Response, 0, len(reqs.Digests))
+	for range reqs.Digests {
+		resps = append(resps, <-responses)
 	}
 	return &execpb.BatchReadBlobsResponse{
 		Responses: resps,
@@ -207,6 +207,6 @@ func (c *Server) BatchReadBlobs(ctx context.Context, reqs *execpb.BatchReadBlobs
 // * `NOT_FOUND`: The requested tree root is not present in the CAS.
 
 func (c *Server) GetTree(req *execpb.GetTreeRequest, gts execpb.ContentAddressableStorage_GetTreeServer) error {
-	logrus.Println("Unimplemented: GetTree")
+	logrus.Errorf("Unimplemented: GetTree")
 	return status.Error(codes.Unimplemented, "GetTree not implemented")
 }
