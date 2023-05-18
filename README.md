@@ -47,7 +47,7 @@ others can connect to it.
 - `--region` - S3 bucket AWS region, default: `us-east-1`
 - `--cache_dir` - where to store blobs locally, required
 
-# Other config
+### Other config
 - `--worker_slots` - Run worker node with concurrent jobs, you must have some nodes with worker_slots to use remote execution, default: `0`
 - `--download_concurrency` - how many concurrent file downloads, default: `10`
 - `--compress` - compress all blobs before storage, default: `true`
